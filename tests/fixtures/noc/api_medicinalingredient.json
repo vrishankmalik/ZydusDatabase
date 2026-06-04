@@ -1,0 +1,34 @@
+[
+  {
+    "noc_number": 99001,
+    "noc_pi_din_product_id": 90001,
+    "noc_pi_medic_ingr_name": "METFORMIN HYDROCHLORIDE",
+    "noc_pi_strength": 500.0,
+    "noc_pi_unit": "MG",
+    "noc_pi_basic_unit": "TAB"
+  },
+  {
+    "noc_number": 99001,
+    "noc_pi_din_product_id": 90002,
+    "noc_pi_medic_ingr_name": "METFORMIN HYDROCHLORIDE",
+    "noc_pi_strength": 850.0,
+    "noc_pi_unit": "MG",
+    "noc_pi_basic_unit": "TAB"
+  },
+  {
+    "noc_number": 99002,
+    "noc_pi_din_product_id": 90010,
+    "noc_pi_medic_ingr_name": "NORETHINDRONE",
+    "noc_pi_strength": 1.0,
+    "noc_pi_unit": "MG",
+    "noc_pi_basic_unit": "TAB"
+  },
+  {
+    "noc_number": 99002,
+    "noc_pi_din_product_id": 90010,
+    "noc_pi_medic_ingr_name": "MESTRANOL",
+    "noc_pi_strength": 0.05,
+    "noc_pi_unit": "MG",
+    "noc_pi_basic_unit": "TAB"
+  }
+]

@@ -8,7 +8,7 @@ import pytest
 
 from tests.conftest import FIXTURES_DIR, load_json, load_html
 from app.sources.dpd import search_dpd
-from app.sources.noc import _parse_results_table as noc_parse_table
+from app.sources.noc import search_noc
 from app.sources.patent_register import _parse_results_table as pr_parse_table
 from app.sources.generic_submissions import _parse_table as gsur_parse_table
 
@@ -71,41 +71,42 @@ class TestDPDSchema:
             assert "drug_code" in r.source_specific
 
 
-# ── NOC parsed-table schema ───────────────────────────────────────────────────
-
-_NOC_ROW_REQUIRED = {
-    "products", "manufacturer", "published_notes",
-    "noc_date", "ingredients", "dins", "record_url", "noc_with_conditions",
-}
-
+# ── NOC JSON API schema ───────────────────────────────────────────────────────
 
 class TestNOCSchema:
-    def test_noc_results_table_fields(self):
-        html = load_html("noc/results_norinyl.html")
-        rows = noc_parse_table(html)
-        assert len(rows) > 0
+    def test_noc_api_ingredient_fixture_fields(self):
+        rows = load_json("noc/api_medicinalingredient.json")
+        assert isinstance(rows, list) and len(rows) > 0
+        required = {"noc_number", "noc_pi_din_product_id", "noc_pi_medic_ingr_name"}
         for row in rows:
-            missing = _NOC_ROW_REQUIRED - set(row)
-            assert not missing, f"NOC row missing fields: {missing}"
+            missing = required - set(row)
+            assert not missing, f"ingredient record missing fields: {missing}"
 
-    def test_noc_row_types(self):
-        html = load_html("noc/results_norinyl.html")
-        rows = noc_parse_table(html)
-        r = rows[0]
-        assert isinstance(r["products"], str)
-        assert isinstance(r["manufacturer"], str)
-        assert isinstance(r["noc_date"], str)
-        assert isinstance(r["noc_with_conditions"], bool)
+    def test_noc_api_drugproduct_fixture_fields(self):
+        rows = load_json("noc/api_drugproduct_99001.json")
+        assert isinstance(rows, list) and len(rows) > 0
+        required = {"noc_number", "noc_br_product_id", "noc_br_brandname", "noc_br_din"}
+        for row in rows:
+            missing = required - set(row)
+            assert not missing, f"drugproduct record missing fields: {missing}"
 
-    def test_noc_empty_table_returns_empty_list(self):
-        html = load_html("noc/results_no_results.html")
-        rows = noc_parse_table(html)
-        assert rows == []
+    def test_noc_api_main_fixture_fields(self):
+        main = load_json("noc/api_main_99001.json")
+        assert isinstance(main, dict)
+        required = {"noc_number", "noc_date", "noc_manufacturer_name", "noc_status_with_conditions"}
+        missing = required - set(main)
+        assert not missing, f"noticeofcompliancemain missing fields: {missing}"
 
-    def test_noc_too_many_returns_empty_list(self):
-        html = load_html("noc/results_too_many.html")
-        rows = noc_parse_table(html)
-        assert rows == []
+    async def test_noc_api_record_schema(self, mock_noc):
+        """DrugRecord produced from NOC JSON API fixture has all required model fields."""
+        result = await search_noc("METFORMIN HYDROCHLORIDE", field="ingredient")
+        assert result.status == "ok"
+        for r in result.records:
+            assert r.source == "NOC"
+            assert isinstance(r.all_ingredients, list)
+            assert isinstance(r.source_specific, dict)
+            assert "noc_date" in r.source_specific
+            assert "noc_number" in r.source_specific
 
 
 # ── Patent Register parsed-table schema ───────────────────────────────────────

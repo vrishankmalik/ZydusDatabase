@@ -82,41 +82,27 @@ def _dpd_side_effect(request: httpx.Request) -> httpx.Response:
     return httpx.Response(404, text=f"No DPD fixture for {path}")
 
 
-# ── NOC routers ───────────────────────────────────────────────────────────────
+# ── NOC API routers ───────────────────────────────────────────────────────────
 
-def _noc_get_side_effect(request: httpx.Request) -> httpx.Response:
-    """Serve the CSRF / session page for any NOC GET."""
-    html = load_html("noc/csrf_page.html")
-    return httpx.Response(
-        200, text=html,
-        headers={"set-cookie": "NOCTOKEN=fixture-session; Path=/noc-ac/; HttpOnly"},
-    )
+def _noc_api_side_effect(request: httpx.Request) -> httpx.Response:
+    """Route NOC JSON API calls to recorded fixtures."""
+    path = request.url.path
+    params = dict(request.url.params)
 
+    if "medicinalingredient" in path:
+        return httpx.Response(200, json=load_json("noc/api_medicinalingredient.json"))
 
-def _noc_post_side_effect(request: httpx.Request) -> httpx.Response:
-    """Route NOC form POSTs to the appropriate results fixture."""
-    raw = request.content.decode("utf-8", errors="replace")
-    parts: dict[str, str] = {}
-    for pair in raw.split("&"):
-        if "=" in pair:
-            k, v = pair.split("=", 1)
-            parts[k] = urllib.parse.unquote_plus(v)
+    if "drugproduct" in path:
+        noc_id = params.get("id", "0")
+        fp = FIXTURES_DIR / f"noc/api_drugproduct_{noc_id}.json"
+        return httpx.Response(200, json=load_json(f"noc/api_drugproduct_{noc_id}.json") if fp.exists() else [])
 
-    brand = parts.get("productName", "").upper()
-    ingredient = parts.get("medicinalIngredient", "").upper()
+    if "noticeofcompliancemain" in path:
+        noc_id = params.get("id", "0")
+        fp = FIXTURES_DIR / f"noc/api_main_{noc_id}.json"
+        return httpx.Response(200, json=load_json(f"noc/api_main_{noc_id}.json") if fp.exists() else {})
 
-    if "NORINYL" in brand:
-        return httpx.Response(200, text=load_html("noc/results_norinyl.html"))
-    if "GLUCOPHAGE" in brand or "METFORMIN" in brand:
-        return httpx.Response(200, text=load_html("noc/results_glucophage.html"))
-    if any(x in brand for x in ("ZZZ", "XYZ", "NONEXISTENT", "NOTADRUG")):
-        return httpx.Response(200, text=load_html("noc/results_no_results.html"))
-    # Broad single-word ingredient → too many records
-    if ingredient and " " not in ingredient.strip():
-        return httpx.Response(200, text=load_html("noc/results_too_many.html"))
-    if ingredient:
-        return httpx.Response(200, text=load_html("noc/results_glucophage.html"))
-    return httpx.Response(200, text=load_html("noc/results_no_results.html"))
+    return httpx.Response(404, text=f"No NOC API fixture for {path}")
 
 
 # ── GSUR router ───────────────────────────────────────────────────────────────
@@ -153,6 +139,27 @@ def _pr_post_side_effect(request: httpx.Request) -> httpx.Response:
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
+@pytest.fixture(autouse=True)
+def _mock_ollama_offline(monkeypatch):
+    """Offline test guard: make _is_ollama_available() return False instantly.
+
+    Without this, every call to parse_labeling_fields() blocks 30 s waiting for
+    httpx DNS resolution of localhost:11434 to time out on this machine.
+    Golden tests (TestPiqrayGolden) exercise the regex fallback path, which is
+    the offline behavior we actually want to test.
+    """
+    try:
+        import asyncio as _asyncio
+        import app.enrichment.labeling as _lab
+
+        async def _offline() -> bool:
+            return False
+
+        monkeypatch.setattr(_lab, "_is_ollama_available", _offline)
+    except ImportError:
+        pass  # labeling module not imported yet — nothing to patch
+
+
 @pytest.fixture
 def no_cache(monkeypatch):
     """Disable the SQLite disk cache in every source module."""
@@ -179,13 +186,10 @@ def mock_dpd(no_cache):
 
 @pytest.fixture
 def mock_noc(no_cache):
-    """respx mock for the NOC CSRF page + doSearch endpoint."""
+    """respx mock for the NOC JSON API endpoints."""
     with respx.mock(assert_all_called=False) as rx:
-        rx.get(re.compile(r"https://health-products\.canada\.ca/noc-ac/.*")).mock(
-            side_effect=_noc_get_side_effect
-        )
-        rx.post("https://health-products.canada.ca/noc-ac/doSearch").mock(
-            side_effect=_noc_post_side_effect
+        rx.get(re.compile(r"https://health-products\.canada\.ca/api/notice-of-compliance/.*")).mock(
+            side_effect=_noc_api_side_effect
         )
         yield rx
 

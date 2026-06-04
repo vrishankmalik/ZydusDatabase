@@ -5,12 +5,17 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.config import SOURCE_TIMEOUT
-from app.export import build_xlsx
+from app.consistency import check_cross_source_consistency
+from app.enrichment.data_protection import fetch_data_protection_table
+from app.enrichment.labeling import enrich_labeling_batch
+from app.enrichment.patents import enrich_patents
+from app.enrichment.store import get_labeling_for_din
+from app.enrichment.workbook import _is_excluded_din, build_workbook
 from app.match import generate_summary
 from app.models import SearchMetadata, SearchResponse, SourceResult
 from app.normalize import normalize_query
@@ -80,6 +85,10 @@ async def search(
 
     sources = [dpd_result, gen_result, noc_result, pr_result]
 
+    # Cross-source consistency warnings (logged; never fail the request)
+    all_records = [rec for s in sources for rec in s.records]
+    check_cross_source_consistency(all_records)
+
     # Optional AI summary
     ai_summary: Optional[str] = None
     if summary:
@@ -100,11 +109,85 @@ async def search(
 async def export(
     q: str = Query(...),
     field: str = Query("ingredient"),
-    summary: bool = Query(False),
+    allow_partial: bool = Query(
+        False,
+        description=(
+            "Build even if a source failed (adds '⚠ Source Status' warning sheet). "
+            "By default the endpoint refuses with HTTP 409 when any source is in error."
+        ),
+    ),
 ) -> Response:
-    """Same search but returns an XLSX file for download."""
-    result = await search(q=q, field=field, summary=summary)
-    xlsx_bytes = build_xlsx(result)
+    """Two-sheet enriched workbook download. Patent and labeling enrichment run automatically.
+
+    Sheet 1 — 'DPD + NOC + Patents': one row per DIN, NOC N/A rows excluded,
+    patent dates and labeling fields populated from the enrichment store.
+    Sheet 2 — 'Generic Submissions': GSUR filtered to the queried ingredient.
+
+    If any source returns status='error' and allow_partial=False (default), the
+    endpoint returns HTTP 409 naming the failed source(s).
+    A no_results source is truthful and does not block the build.
+    """
+    result = await search(q=q, field=field, summary=False)
+
+    # Guard: refuse to silently build a partial workbook when a source failed.
+    # "error" = fetch failed; "no_results" = genuine empty (allowed to proceed).
+    error_sources: dict[str, Optional[str]] = {
+        s.source: s.error_message
+        for s in result.sources
+        if s.status == "error"
+    }
+    if error_sources and not allow_partial:
+        names = ", ".join(error_sources.keys())
+        details = "; ".join(
+            f"{k}: {v or 'unknown error'}" for k, v in error_sources.items()
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Source(s) failed: {names} — refusing to build a partial workbook. "
+                f"Pass allow_partial=true to override. Details: {details}"
+            ),
+        )
+
+    # Collect valid DINs for enrichment
+    all_valid_dins = [
+        r.din
+        for s in result.sources
+        for r in s.records
+        if not _is_excluded_din(r.din)
+    ]
+
+    # Patent enrichment — always runs; the module skips DINs already stored
+    if all_valid_dins:
+        await enrich_patents(all_valid_dins)
+
+    # Labeling enrichment — only for DPD records (need drug_code + strength);
+    # skip DINs already in the store so repeat exports are fast.
+    din_map: dict[str, tuple[int, Optional[str]]] = {}
+    for s in result.sources:
+        if s.source != "DPD":
+            continue
+        for r in s.records:
+            if _is_excluded_din(r.din):
+                continue
+            drug_code_raw = r.source_specific.get("drug_code")
+            if drug_code_raw is None:
+                continue
+            try:
+                din_key = r.din.strip()  # type: ignore[union-attr]
+                if get_labeling_for_din(din_key) is None:
+                    din_map[din_key] = (int(drug_code_raw), r.strength)
+            except (ValueError, TypeError):
+                pass
+    if din_map:
+        await enrich_labeling_batch(din_map)
+
+    dp_table = await fetch_data_protection_table()
+    xlsx_bytes = build_workbook(
+        result,
+        source_errors=error_sources if allow_partial and error_sources else None,
+        dp_table=dp_table,
+    )
     filename = f"canadian_drugs_{q.replace(' ', '_')}_{field}.xlsx"
     return Response(
         content=xlsx_bytes,
@@ -503,9 +586,8 @@ async function doSearch() {
 function doExport() {
   const q = document.getElementById('query').value.trim();
   const field = document.getElementById('field').value;
-  const summary = document.getElementById('summary').checked;
   if (!q) return;
-  window.location = `/api/export?q=${encodeURIComponent(q)}&field=${field}&summary=${summary}`;
+  window.location = `/api/export?q=${encodeURIComponent(q)}&field=${field}`;
 }
 
 document.getElementById('query').addEventListener('keydown', e => {

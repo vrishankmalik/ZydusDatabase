@@ -74,56 +74,67 @@ class TestDPDGolden:
         assert r.record_url and r.record_url.startswith("https://health-products.canada.ca")
 
 
-# ── NOC golden values ─────────────────────────────────────────────────────────
+# ── NOC golden values (JSON API) ──────────────────────────────────────────────
 
 class TestNOCGolden:
-    async def test_norinyl_brand_search(self, mock_noc):
-        """Brand search for NORINYL 1/50 21DAY returns correct DIN and ingredients."""
-        result = await search_noc("NORINYL 1/50 21DAY", field="brand")
+    async def test_norethindrone_ingredient_search(self, mock_noc):
+        """Ingredient search for NORETHINDRONE returns correct DIN and all_ingredients."""
+        result = await search_noc("NORETHINDRONE", field="ingredient")
         assert result.status == "ok", result.error_message
         assert result.count >= 1
         r = result.records[0]
         assert r.source == "NOC"
         assert "NORINYL" in (r.brand_name or "").upper()
-        assert r.din == "02188724"
-        # Ingredients must include both active ingredients
+        assert r.din == "00613100"
         ingredient_upper = (r.ingredient or "").upper()
         assert "NORETHINDRONE" in ingredient_upper
         assert "MESTRANOL" in ingredient_upper
 
-    async def test_norinyl_all_ingredients(self, mock_noc):
-        """all_ingredients must be populated from the semicolon-separated ingredient string."""
-        result = await search_noc("NORINYL 1/50 21DAY", field="brand")
+    async def test_norethindrone_all_ingredients(self, mock_noc):
+        """all_ingredients must contain both active ingredients for the combination product."""
+        result = await search_noc("NORETHINDRONE", field="ingredient")
+        assert result.status == "ok"
         r = result.records[0]
         assert len(r.all_ingredients) >= 2
         names_upper = [n.upper() for n in r.all_ingredients]
         assert "NORETHINDRONE" in names_upper
         assert "MESTRANOL" in names_upper
 
-    async def test_norinyl_noc_date_in_source_specific(self, mock_noc):
-        """source_specific must carry noc_date."""
-        result = await search_noc("NORINYL 1/50 21DAY", field="brand")
-        r = result.records[0]
-        assert "noc_date" in r.source_specific
-        assert r.source_specific["noc_date"] == "1984-01-18"
-
-    async def test_norinyl_record_url_contains_noc_id(self, mock_noc):
-        """record_url must link to the NOC detail page with id=3369."""
-        result = await search_noc("NORINYL 1/50 21DAY", field="brand")
-        r = result.records[0]
-        assert r.record_url is not None
-        assert "3369" in r.record_url
-
-    async def test_glucophage_brand_search(self, mock_noc):
-        """Brand search for Glucophage returns a valid metformin NOC record."""
-        result = await search_noc("Glucophage", field="brand")
+    async def test_noc_date_in_source_specific(self, mock_noc):
+        """source_specific must carry noc_date in ISO YYYY-MM-DD format."""
+        result = await search_noc("NORETHINDRONE", field="ingredient")
         assert result.status == "ok"
         r = result.records[0]
-        assert r.din == "02229895"
-        assert "METFORMIN" in (r.ingredient or "").upper()
+        assert "noc_date" in r.source_specific
+        assert r.source_specific["noc_date"] == "1972-05-10"
+
+    async def test_record_url_contains_noc_number(self, mock_noc):
+        """record_url must link to the NOC detail page for the noc_number."""
+        result = await search_noc("NORETHINDRONE", field="ingredient")
+        assert result.status == "ok"
+        r = result.records[0]
+        assert r.record_url is not None
+        assert "99002" in r.record_url  # fixture noc_number
+
+    async def test_metformin_ingredient_search(self, mock_noc):
+        """Ingredient search for METFORMIN HYDROCHLORIDE returns DIN and brand from fixture."""
+        result = await search_noc("METFORMIN HYDROCHLORIDE", field="ingredient")
+        assert result.status == "ok"
+        dins = [r.din for r in result.records if r.din]
+        assert "02229895" in dins
+        brands = [r.brand_name for r in result.records if r.brand_name]
+        assert any("GLUCOPHAGE" in (b or "").upper() for b in brands)
 
     async def test_noc_status_field(self, mock_noc):
-        """NOC records have status = 'NOC' (no published_notes) or 'NOC/c'."""
-        result = await search_noc("NORINYL 1/50 21DAY", field="brand")
+        """NOC records have status = 'NOC' or 'NOC/c' based on noc_status_with_conditions."""
+        result = await search_noc("METFORMIN HYDROCHLORIDE", field="ingredient")
+        assert result.status == "ok"
         for r in result.records:
             assert r.status in ("NOC", "NOC/c"), f"Unexpected status: {r.status}"
+
+    async def test_brand_field_returns_unsupported(self, mock_noc):
+        """Brand search is unsupported in the JSON API — must not return error."""
+        result = await search_noc("NORINYL 1/50 21DAY", field="brand")
+        assert result.status == "unsupported", (
+            f"Expected unsupported; got {result.status}"
+        )

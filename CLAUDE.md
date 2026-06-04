@@ -8,6 +8,7 @@ A local web application that searches four Canadian health-product databases sim
 app/
   main.py                # FastAPI app, routes, HTML UI embedded
   config.py              # All configuration (URLs, timeouts, model name, TTLs)
+  consistency.py         # Cross-source DIN consistency checker (warnings, not errors)
   sources/
     dpd.py               # Drug Product Database — official REST API only (no scraping)
     generic_submissions.py  # Static HTML table, httpx + BeautifulSoup
@@ -15,10 +16,27 @@ app/
     patent_register.py   # Patent Register — JSP form POST, SSL workaround
   normalize.py           # Static synonym map + optional Ollama llama3 expansion
   match.py               # Optional llama3 AI summary generation
-  export.py              # XLSX builder (pandas + openpyxl)
   cache.py               # SQLite disk cache with TTL
   models.py              # Shared Pydantic result schema
-tests/                   # pytest tests per source (require live network)
+  enrichment/
+    store.py             # SQLite enrichment store (patents + labeling tables, $CACHE_DIR/enrichment.db)
+    patents.py           # enrich-patents: fetch patent dates + cross-check Patent.zip bulk data
+    labeling.py          # enrich-labeling: per-strength PDF field extraction (cite-or-blank)
+    workbook.py          # build-workbook: two-tab enriched Excel export
+tests/
+  reconciliation/        # Completeness tests against DPD bulk extract (integration, slow)
+    downloader.py        # Download + cache allfiles.zip with freshness check
+    dpd_parser.py        # Parse drug.txt/ingred.txt, build DIN sets
+    test_reconciliation.py  # Hard-fail if extract − pipeline > 0.5%
+  test_cross_source_consistency.py  # DIN-keyed ingredient/brand agreement across sources
+  test_fuzzy_precision.py           # Precision ≥ 0.95 on labeled fuzzy_pairs.csv
+  test_enrich_patents.py            # Patent detail parsing + discrepancy resolution tests
+  test_enrich_labeling.py           # Alpelisib PIQRAY golden test + no-fabrication assertion
+  test_build_workbook.py            # Two-tab schema: NOC N/A exclusion, DIN sort, GSUR standalone
+  fixtures/
+    fuzzy_pairs.csv                 # Hand-labeled (query, option, expected_match) benchmark
+    labeling/piqray_pages.json      # PIQRAY monograph fixture for golden labeling tests
+    patent_register/detail_2709025.html  # Patent detail page fixture
 ```
 
 ## Running
@@ -57,12 +75,18 @@ python3 -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - **Supports:** ingredient, company only (brand/DIN → unsupported)
 
 ### 3. Notice of Compliance (NOC)
-- **Method:** Session cookie + CSRF token, POST to `/noc-ac/doSearch`
-- **URL:** `https://health-products.canada.ca/noc-ac/`
-- **Form fields:** medicinalIngredient, productName, din, manufacturer, submissionClass, therapeuticClass, submissionType, productType, nocFromDate, nocToDate
-- **Behaviour:** Returns "too many records" error for broad ingredient searches (e.g. plain "metformin"). Use full salt form ("metformin hydrochloride") or brand name.
-- **Table columns:** Product(s) | Manufacturer | Published Notes | NOC Date | Medicinal ingredient(s) | DIN(s)
-- **Supports:** ingredient, brand, company, DIN
+- **Method:** Official JSON API — no form posts, no CSRF
+- **API base:** `https://health-products.canada.ca/api/notice-of-compliance/`
+- **Ingredient search flow:**
+  1. `GET /medicinalingredient/?type=json&lang=en` — full list (~93 k rows, cached per TTL)
+  2. Filter in memory where `noc_pi_medic_ingr_name` contains the queried term
+  3. Expand each matched product to capture all its co-ingredients (combination products)
+  4. For each unique `noc_number` (capped at 200): concurrently fetch
+     - `GET /drugproduct/?id=<n>&type=json&lang=en` → `(noc_br_product_id, noc_br_din, noc_br_brandname)`
+     - `GET /noticeofcompliancemain/?id=<n>&type=json&lang=en` → `noc_date, noc_manufacturer_name, noc_submission_class`
+  5. Join `noc_pi_din_product_id == noc_br_product_id` to attach DIN to each product row
+  6. Emit one `DrugRecord` per `(noc_number, product_id)`; `record_url = /noc-ac/nocInfo?id=<noc_number>`
+- **Supports:** ingredient only — brand/company/DIN return `status="unsupported"` (the old CSRF scraper returned "too many records" for broad ingredient searches; the JSON API has no such limit)
 
 ### 4. Patent Register (PR-RDB)
 - **Method:** Session cookie (JSESSIONID), POST to `/pr-rdb/search`
@@ -101,15 +125,96 @@ To clear: delete `/tmp/canadian_drug_db_cache/cache.db`.
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -v --asyncio-mode=auto
+# Offline suite (fast, no network — always run this in CI)
+make test
+
+# Integration suite (live government sites)
+make test-live
+
+# Completeness reconciliation against DPD nightly bulk extract (slow, nightly)
+make reconcile
 ```
 
-All tests require live network access to Canadian government sites. Tests are marked to handle gracefully when sites return expected error conditions (e.g., NOC "too many records").
+Three additional accuracy checks beyond fixture-based tests:
+1. **Completeness reconciliation** (`make reconcile`) — downloads the DPD `allfiles.zip` bulk extract, builds extract DIN set per ingredient, hard-fails if pipeline misses >0.5% of extract DINs.
+2. **Cross-source consistency** (`test_cross_source_consistency.py`) — for every DIN in ≥2 sources, asserts ingredient sets and brand names agree. Runs as warnings on every live search; also has offline fixture tests.
+3. **Fuzzy precision/recall** (`test_fuzzy_precision.py`) — uses `tests/fixtures/fuzzy_pairs.csv` (hand-labeled) to assert Patent Register ingredient matcher precision ≥ 0.95. Fuzzy cutoff raised to 0.75 to eliminate false-positive drug matches.
+
+See `tests/README.md` for full tier descriptions and tolerance rationale.
+
+## Enrichment Pipeline (three chained commands)
+
+All three commands share the SQLite enrichment store at `$CACHE_DIR/enrichment.db`. Run them in order after a search to build a fully enriched workbook.
+
+### `enrich-patents`
+
+`python -m app.enrichment.patents --dins DIN1 DIN2 ...`  
+Or via API: `GET /api/export-enriched?q=alpelisib&field=ingredient` (runs enrich-patents automatically).
+
+- Looks up each DIN's patent numbers from the Patent Register live search.
+- For each patent, fetches the detail page for filing/grant/expiry dates.
+- Downloads `Patent.zip` bulk extract and cross-checks every date field.
+- **On discrepancy: uses the website value** and logs (DIN, patent_number, field, website_value, zip_value) to the `patent_discrepancies` table.
+- Stores rows in `patents(din, patent_number, filing_date, grant_date, expiry_date)`.
+- A DIN with no patents, or a patent with no dates, is recorded cleanly.
+
+### `enrich-labeling` (accuracy-critical)
+
+`python -m app.enrichment.labeling --drug-code CODE --din DIN --strength "50 mg"`
+
+**Cite-or-blank rule:** every extracted value stores the page number it came from. If a field is not in the document, store exactly `"Not stated"` — never infer. Non-stated values have `_page = NULL`.
+
+**Per-strength matching (required):** the DIN's strength (from DPD) is normalised and used to select only the matching Description block in §6. One PDF → one row per DIN with that DIN's physical descriptors.
+
+**Sections read:**
+- §6 Dosage Forms/Composition/Packaging: active_ingredient, excipients (core + coating separately), preservatives, pack_size, pack_style, colour, shape, size_mm, weight.
+- §13 Pharmaceutical Information: pH. If only a pH-dependent solubility table is present, stores `"Not stated (pH-dependent solubility only)"`.
+
+**Scanned PDFs:** if the PDF has no selectable text, every field → `"needs OCR / manual check"`, `needs_ocr=1`.
+
+**Golden accuracy fixture:** `tests/fixtures/labeling/piqray_pages.json` contains the alpelisib/PIQRAY monograph text (human-verified). `TestPiqrayGolden` in `test_enrich_labeling.py` asserts exact match on all expected values and enforces the no-fabrication rule (every non-Not-stated field must cite a page present in the fixture).
+
+### `build-workbook`
+
+`python -m app.enrichment.workbook --q alpelisib --field ingredient`  
+Or via the **single export API**: `GET /api/export?q=alpelisib&field=ingredient`
+
+**There is one export. It is the two-sheet enriched workbook. Enrichment (patents + labeling) runs automatically — no flags needed.** The old multi-sheet format (`export.py`, per-source sheets, Combined, By Combination) has been deleted.
+
+Produces a **two-tab XLSX**:
+
+**Sheet 1 — "DPD + NOC + Patents"** (one row per DIN, sorted ascending):
+- DPD fields: brand, company, ingredient, strength, form, route, status, record_url.
+- NOC fields: noc_brand_name, noc_company, noc_date, noc_submission_type (joined by DIN).
+- **NOC rows whose DIN is blank / "Not Applicable" / "N/A" are excluded entirely.**
+- Patent block per DIN: patent_count, patent_numbers, earliest_filing_date, earliest_grant_date, latest_expiry_date, all_patents_detail.
+- Labeling block per DIN: all 11 label fields + `_page` citation columns.
+
+**Sheet 2 — "Generic Submissions"** (standalone, never joined to Sheet 1):
+- GSUR records filtered to the queried ingredient (substring match, same normalisation).
+- No DIN column. Completely separate from Sheet 1.
+
+**Export API behaviour:**
+- `GET /api/export?q=<term>&field=ingredient` — always produces the two-sheet workbook.
+- Patent enrichment runs automatically before workbook assembly; already-stored patents are reused.
+- Labeling enrichment runs automatically for DPD DINs not yet in the store; cached data is reused.
+- `allow_partial=true` — build even when a source is in error (adds a `⚠ Source Status` warning sheet). Default is HTTP 409 on error.
+- `no_results` from a source is truthful and never blocks the export.
+
+### Enrichment store schema
+
+`$CACHE_DIR/enrichment.db` (separate from the HTTP cache `cache.db`):
+
+```sql
+patents(din, patent_number, filing_date, grant_date, expiry_date, detail_url, fetched_at)
+patent_discrepancies(din, patent_number, field, website_value, zip_value, logged_at)
+labeling(din, drug_code, pdf_url, active_ingredient, active_ingredient_page, ..., needs_ocr, has_unverified, fetched_at)
+```
 
 ## Dependencies
 
 ```
-fastapi uvicorn httpx beautifulsoup4 openpyxl pandas pydantic python-multipart
+fastapi uvicorn httpx beautifulsoup4 openpyxl pandas pydantic python-multipart pdfplumber
 ```
 
 Optional for tests:
@@ -161,5 +266,8 @@ Combined view and each per-source tab render results as **collapsible `<details>
 - **NOC broad searches fail:** The NOC site returns an error for ingredient names that match too many records (>500). The UI surfaces this as an error with a helpful message.
 - **Patent Register SSL:** The PR-RDB server has a certificate the standard CA bundle won't verify. We disable verification (`verify=False`) explicitly — this is equivalent to a user clicking "Proceed anyway" in a browser.
 - **Patent Register ingredient matching:** The ingredient field is a dropdown of 469 specific values (exact salt forms). Fuzzy substring matching is used to find closest options, but niche ingredients may not appear in the Patent Register at all.
+- **Patent Register no_results for generics:** Long-off-patent generics (e.g. metformin) return `no_results` from the Patent Register — this is truthful, not a bug.
 - **Generic Submissions company names:** Pre-April 2024 entries show "Not available" as the company name — this is accurate, not a bug.
 - **DPD concurrency cap:** With 242 drug codes for "metformin", all 242 are queried concurrently behind a semaphore of 5. Full results may take 5–15 seconds on first load (cached after).
+- **NOC brand/company/DIN searches unsupported:** The JSON API migration only exposes ingredient search. Brand, company, and DIN searches return `status="unsupported"`. The old HTML/CSRF scraper would have handled these but was removed.
+- **error vs no_results distinction:** `status="error"` means the source fetch failed (network/parse error). `status="no_results"` means the source responded successfully but returned no matching records. These must never be conflated. The `/api/export-enriched` endpoint refuses to build a workbook (HTTP 409) when any source is in `error` by default; pass `allow_partial=true` to override (adds a `⚠ Source Status` warning sheet). A `no_results` source does not block the build.

@@ -258,26 +258,15 @@ async def test_patent_register_results_carry_patent_number(mock_patent_register)
             assert "patent_number" in r.source_specific
 
 
-# ── NOC DIN-less radiopharmaceutical row ─────────────────────────────────────
+# ── NOC DIN normalisation for N/A values ─────────────────────────────────────
 
-async def test_noc_din_none_is_acceptable():
-    """A NOC row where dins='Not applicable' stores din=None, not an empty string."""
-    from app.sources.noc import _parse_results_table
-    html = """
-    <table>
-      <tr>
-        <td><a href="/noc-ac/nocInfo?id=9999">RADIODRUG</a></td>
-        <td>RADIO PHARMA INC</td>
-        <td></td>
-        <td>2010-01-01</td>
-        <td>TECHNETIUM TC 99M</td>
-        <td>Not applicable</td>
-      </tr>
-    </table>
-    """
-    rows = _parse_results_table(html)
-    assert len(rows) == 1
-    assert rows[0]["dins"] is None, "Not applicable should map to None, not a string"
+def test_noc_din_not_applicable_normalises_to_none():
+    """noc_br_din values of 'N/A' and 'Not Applicable' must normalise to None."""
+    from app.sources.noc import _normalize_din
+    assert _normalize_din("Not applicable") is None
+    assert _normalize_din("N/A") is None
+    assert _normalize_din("NA") is None
+    assert _normalize_din("02242974") == "02242974"
 
 
 # ── GSUR _parse_table edge cases ──────────────────────────────────────────────

@@ -7,10 +7,10 @@ downstream consumers.
 import re
 import pytest
 
-from tests.conftest import load_json, load_html
+from tests.conftest import load_json, load_html  # noqa: F401  (load_html kept for future use)
 from app.din_utils import is_valid_din
 from app.sources.dpd import search_dpd
-from app.sources.noc import search_noc, _parse_results_table as noc_parse_table
+from app.sources.noc import search_noc
 from app.sources.generic_submissions import search_generic_submissions, _parse_table as gsur_parse_table
 from app.sources.patent_register import search_patent_register, _parse_results_table as pr_parse_table
 
@@ -32,16 +32,13 @@ class TestDINFormat:
                 )
 
     async def test_noc_dins_are_8_digits(self, mock_noc):
-        result = await search_noc("NORINYL 1/50 21DAY", field="brand")
+        result = await search_noc("METFORMIN HYDROCHLORIDE", field="ingredient")
         assert result.status == "ok"
         for r in result.records:
             if r.din:
-                # NOC DINs can be multi-value; check each after splitting.
-                from app.din_utils import parse_dins
-                for din in parse_dins(r.din):
-                    assert _DIN_RE.fullmatch(din), (
-                        f"NOC DIN segment {din!r} is not 8 digits"
-                    )
+                assert _DIN_RE.fullmatch(r.din), (
+                    f"NOC DIN {r.din!r} for {r.brand_name!r} is not 8 digits"
+                )
 
     def test_patent_register_din_8_digits(self):
         html = load_html("patent_register/results_metformin.html")
@@ -57,14 +54,13 @@ class TestDINFormat:
 
 class TestDateFormat:
     def test_noc_dates_are_iso(self):
-        html = load_html("noc/results_norinyl.html")
-        rows = noc_parse_table(html)
-        for row in rows:
-            date_str = row.get("noc_date", "")
-            if date_str:
-                assert _ISO_DATE_RE.fullmatch(date_str), (
-                    f"NOC date {date_str!r} is not ISO YYYY-MM-DD"
-                )
+        from tests.conftest import load_json
+        main = load_json("noc/api_main_99001.json")
+        date_str = main.get("noc_date", "")
+        assert date_str, "api_main_99001.json must have a noc_date field"
+        assert _ISO_DATE_RE.fullmatch(date_str), (
+            f"NOC API date {date_str!r} is not ISO YYYY-MM-DD"
+        )
 
     async def test_dpd_last_update_date_is_iso(self, mock_dpd):
         result = await search_dpd("metformin", field="ingredient")
@@ -93,7 +89,7 @@ class TestNoNullColumns:
         assert len(companies) > 0, "company is 100% null for DPD result"
 
     async def test_noc_ingredient_not_all_null(self, mock_noc):
-        result = await search_noc("NORINYL 1/50 21DAY", field="brand")
+        result = await search_noc("METFORMIN HYDROCHLORIDE", field="ingredient")
         assert result.status == "ok"
         ingredients = [r.ingredient for r in result.records if r.ingredient]
         assert len(ingredients) > 0, "ingredient is 100% null for NOC result"
@@ -125,10 +121,10 @@ async def test_dpd_live_record_counts_logged():
 
 @pytest.mark.integration
 async def test_noc_live_record_counts_logged():
-    result = await search_noc("Glucophage", field="brand")
-    assert result.status in ("ok", "no_results")
+    result = await search_noc("METFORMIN HYDROCHLORIDE", field="ingredient")
+    assert result.status in ("ok", "no_results"), f"unexpected: {result.status}: {result.error_message}"
     if result.status == "ok":
-        print(f"\n[quality] NOC Glucophage count={result.count}")
+        print(f"\n[quality] NOC METFORMIN HYDROCHLORIDE count={result.count}")
         assert result.count > 0
 
 
@@ -141,7 +137,8 @@ class TestSourceTagging:
             assert r.source == "DPD"
 
     async def test_noc_records_tagged(self, mock_noc):
-        result = await search_noc("NORINYL 1/50 21DAY", field="brand")
+        result = await search_noc("METFORMIN HYDROCHLORIDE", field="ingredient")
+        assert result.status == "ok"
         for r in result.records:
             assert r.source == "NOC"
 

@@ -137,6 +137,68 @@ tests/fixtures/
     results_no_results.html               # empty results page
 ```
 
+---
+
+## Accuracy tests (beyond fixture coverage)
+
+### Completeness reconciliation (`tests/reconciliation/`)
+
+**What it guards against:** Result caps, missing pages, source-drift bugs that cause the
+pipeline to silently return a subset of available products.  No fixture-based test can catch
+a 150-vs-250 DIN gap because fixtures are hand-curated at the number you see.
+
+**How it works:** Downloads the Health Canada DPD nightly bulk extract (`allfiles.zip`,
+~1.4 MB, cached 12 h).  Applies the same case-insensitive substring rule the live API uses
+to build the extract's DIN set for a given ingredient.  Compares against the pipeline's DIN
+set.  Hard-fails if `extract − pipeline` exceeds 0.5% (≈1 in 200 DINs) — a tolerance chosen
+to absorb one-day nightly-refresh timing skew without masking real bugs.
+
+**Tolerance rationale:** 0.5% is tight enough to catch any result-cap regression (a 150/250
+gap = 37% miss rate, 74× the tolerance) while being loose enough to pass when the bulk
+extract and live API differ by one product due to same-day updates.
+
+**Sample ingredients tested:** `acetaminophen` (high-volume, ~250 DINs),
+`ibuprofen` (mid, ~68), `azithromycin` (rare, ~24),
+`cetirizine hydrochloride` (salt/multi-word, ~29).
+
+**Run:** `make reconcile`  (requires live network; slow on first run, fast from cache)
+
+**NOC note:** Health Canada does not publish a downloadable bulk export for the NOC database.
+The NOC reconciliation stub is included in the code and will activate if/when those files
+become publicly available.
+
+### Cross-source consistency (`test_cross_source_consistency.py`)
+
+**What it guards against:** Column-index shifts and mis-joins that look correct in isolation
+but produce wrong values when the same DIN is seen from two sources.  E.g., a NOC parser
+reading the wrong HTML column would pass all single-source tests but disagree with DPD on
+ingredient name for the same DIN.
+
+**How it works:** For every DIN present in ≥2 sources, asserts that the normalized ingredient
+sets and case-normalized brand names agree.  Disagreements are emitted as `WARNING` log
+entries during live runs (never raise exceptions) and are caught as hard assertion failures
+in the fixture test (which deliberately injects a mismatched record).
+
+**Wired into:** `app/main.py` — runs on every search response; results only go to the server
+log.
+
+### Fuzzy matcher precision / recall (`test_fuzzy_precision.py`)
+
+**What it guards against:** The Patent Register ingredient dropdown matcher silently linking
+a user query to the *wrong* dropdown option, corrupting patent-linkage decisions.  False
+positives ("aspirin" matching "atorvastatin") are more dangerous than false negatives.
+
+**How it works:** Loads `tests/fixtures/fuzzy_pairs.csv` (25 hand-labeled
+query/option/expected_match triples), runs `_find_matching_options` from `patent_register.py`
+against the fixture dropdown, and computes precision and recall.  **Asserts precision ≥ 0.95.**
+Recall is printed but not hard-asserted (a missed link is safer than a wrong one).
+
+**Threshold tuning:** The fuzzy cutoff was raised from 0.6 → 0.75 after the benchmark
+revealed that `"canagliflozn"` (typo) matched `"EMPAGLIFLOZIN"` (different drug) at 0.6.
+At 0.75 that false positive is eliminated; precision = 1.0 on the benchmark.
+
+---
+
 ## Adding a new test
 
 1. Decide the tier (schema? golden? regression? normalization?).

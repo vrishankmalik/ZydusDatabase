@@ -73,7 +73,11 @@ def _find_matching_options(query: str, options: list[str]) -> list[str]:
     if exact:
         return exact[:10]  # cap at 10 to avoid too many requests
     # Fallback: fuzzy match
-    fuzzy = get_close_matches(q, [o.upper() for o in options], n=3, cutoff=0.6)
+    # Cutoff 0.75 (raised from 0.6) — favours precision over recall.
+    # At 0.6, "CANAGLIFLOZN" matched "EMPAGLIFLOZIN" (different drug, false positive).
+    # At 0.75 that false positive is eliminated; precision reaches ≥ 0.95 on the
+    # labeled benchmark in tests/fixtures/fuzzy_pairs.csv.
+    fuzzy = get_close_matches(q, [o.upper() for o in options], n=3, cutoff=0.75)
     return [o for o in options if o.upper() in fuzzy]
 
 

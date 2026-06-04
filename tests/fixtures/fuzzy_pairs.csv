@@ -1,0 +1,26 @@
+query,option,expected_match,notes
+metformin,METFORMIN HYDROCHLORIDE,true,substring match — base name in salt form
+metformin hydrochloride,METFORMIN HYDROCHLORIDE,true,exact match
+metformin,METFORMIN HYDROCHLORIDE / CANAGLIFLOZIN,true,substring match in combo option
+amlodipine,AMLODIPINE BESYLATE,true,substring match — base name in salt form
+atorvastatin,ATORVASTATIN CALCIUM,true,substring match — base name in salt form
+canagliflozin,CANAGLIFLOZIN,true,exact match
+canagliflozin,METFORMIN HYDROCHLORIDE / CANAGLIFLOZIN,true,substring match in combo
+empagliflozin,EMPAGLIFLOZIN,true,exact match
+sitagliptin,SITAGLIPTIN PHOSPHATE,true,substring match — base name in salt form
+sitagliptin,METFORMIN HYDROCHLORIDE / SITAGLIPTIN PHOSPHATE,true,substring match in combo
+rosuvastatin,ROSUVASTATIN CALCIUM,true,substring match — base name in salt form
+norethindrone,NORETHINDRONE,true,exact match
+doxepin,DOXEPIN HYDROCHLORIDE,true,substring match — base name in salt form
+canagliflozn,CANAGLIFLOZIN,true,fuzzy match — single char typo (ratio 0.96 > threshold 0.75)
+metformin-hcl,METFORMIN HYDROCHLORIDE,false,fuzzy match below threshold at 0.75 (ratio 0.667) — acceptable recall miss because precision is more critical than linking abbreviations
+ibuprofen,METFORMIN HYDROCHLORIDE,false,unrelated drug — no match expected
+ibuprofen,AMLODIPINE BESYLATE,false,unrelated drug — no match expected
+aspirin,ATORVASTATIN CALCIUM,false,unrelated drug; slight phonetic overlap must not cause false match
+metformin,DOXEPIN HYDROCHLORIDE,false,metformin not a substring of doxepin hcl
+metformin,EMPAGLIFLOZIN,false,different drug
+canagliflozin,AMLODIPINE BESYLATE,false,different drug
+canagliflozin,ROSUVASTATIN CALCIUM,false,different drug
+canagliflozn,EMPAGLIFLOZIN,false,typo of canagliflozin must not match a different drug (ratio 0.72 < threshold 0.75 — tests the precision-tuned cutoff)
+norethindrone,METFORMIN HYDROCHLORIDE,false,different drug class
+empagliflozin,SITAGLIPTIN PHOSPHATE,false,different drug

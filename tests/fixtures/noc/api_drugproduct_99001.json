@@ -1,0 +1,16 @@
+[
+  {
+    "noc_number": 99001,
+    "noc_br_brand_id": 1001,
+    "noc_br_brandname": "GLUCOPHAGE",
+    "noc_br_din": "02229895",
+    "noc_br_product_id": 90001
+  },
+  {
+    "noc_number": 99001,
+    "noc_br_brand_id": 1001,
+    "noc_br_brandname": "GLUCOPHAGE",
+    "noc_br_din": "02229896",
+    "noc_br_product_id": 90002
+  }
+]

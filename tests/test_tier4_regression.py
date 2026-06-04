@@ -9,7 +9,7 @@ import httpx
 import respx
 
 from app.sources.dpd import search_dpd
-from app.sources.noc import search_noc, _parse_results_table as noc_parse_table
+from app.sources.noc import search_noc
 from app.sources.generic_submissions import search_generic_submissions
 from app.sources.patent_register import search_patent_register
 from app.din_utils import parse_dins
@@ -73,30 +73,28 @@ async def test_dpd_cap_is_exposed_via_total_matches(mock_dpd, monkeypatch):
         pass
 
 
-# ── Regression 2: NOC DIN attachment ─────────────────────────────────────────
+# ── Regression 2: NOC DIN attachment (JSON API) ───────────────────────────────
 
-def test_noc_din_attachment_rate():
-    """≥95% of NOC result rows must carry a non-empty DIN.
+async def test_noc_din_attachment_rate(mock_noc):
+    """≥95% of NOC API result records must carry a non-empty DIN.
 
-    Guards against the bug in the scraping version where DINs were lost
-    because the wrong HTML column was read.
+    Guards against the product_id→DIN join being broken so that DINs are lost.
     """
-    from tests.conftest import load_html
-    html = load_html("noc/results_norinyl.html")
-    rows = noc_parse_table(html)
-    assert len(rows) > 0
+    result = await search_noc("METFORMIN HYDROCHLORIDE", field="ingredient")
+    assert result.status == "ok", f"Expected ok, got {result.status}: {result.error_message}"
+    assert result.count > 0
 
-    rows_with_din = [r for r in rows if r.get("dins") and r["dins"].strip()]
-    rate = len(rows_with_din) / len(rows)
+    records_with_din = [r for r in result.records if r.din and r.din.strip()]
+    rate = len(records_with_din) / result.count
     assert rate >= 0.95, (
-        f"Only {rate*100:.0f}% of NOC rows have DINs — expected ≥95%. "
-        f"Column mapping may be wrong."
+        f"Only {rate*100:.0f}% of NOC records have DINs — expected ≥95%. "
+        f"product_id→DIN join may be broken."
     )
 
 
 async def test_noc_din_on_record(mock_noc):
-    """A NOC record from the fixture carries a non-empty din field."""
-    result = await search_noc("NORINYL 1/50 21DAY", field="brand")
+    """Every NOC record from the fixture carries a non-empty din field."""
+    result = await search_noc("METFORMIN HYDROCHLORIDE", field="ingredient")
     assert result.status == "ok"
     for r in result.records:
         assert r.din is not None and r.din.strip(), (
@@ -104,7 +102,7 @@ async def test_noc_din_on_record(mock_noc):
         )
 
 
-# ── Regression 3: Multi-DIN explosion ────────────────────────────────────────
+# ── Regression 3: DIN parsing utilities ──────────────────────────────────────
 
 def test_multi_din_split_three():
     """'02535742,; 02535750,; 02535734' must explode into exactly 3 DINs."""
@@ -115,16 +113,14 @@ def test_multi_din_split_three():
     assert "02535734" in dins
 
 
-def test_multi_din_raw_noc_column_parsing():
-    """The multi-DIN NOC fixture HTML produces a raw DIN string with all three values."""
-    from tests.conftest import load_html
-    html = load_html("noc/results_multi_din.html")
-    rows = noc_parse_table(html)
-    assert len(rows) == 1
-    raw = rows[0]["dins"] or ""
-    # Parse it — all three DINs must be recoverable.
-    dins = parse_dins(raw)
-    assert len(dins) == 3
+def test_noc_api_din_normalization():
+    """NOC API DIN values of N/A must be normalised to None."""
+    from app.sources.noc import _normalize_din
+    assert _normalize_din("N/A") is None
+    assert _normalize_din("NA") is None
+    assert _normalize_din("Not Applicable") is None
+    assert _normalize_din("") is None
+    assert _normalize_din("02242974") == "02242974"
 
 
 # ── Regression 4: Empty-not-error ────────────────────────────────────────────
@@ -139,9 +135,17 @@ async def test_dpd_nonsense_query_returns_no_results_not_exception(mock_dpd):
         assert result.count == 0
 
 
-async def test_noc_nonsense_brand_returns_no_results_not_exception(mock_noc):
-    result = await search_noc("zzzznotadrug", field="brand")
+async def test_noc_nonsense_ingredient_returns_no_results_not_exception(mock_noc):
+    result = await search_noc("zzzznotadrug", field="ingredient")
     assert result.status in ("no_results", "ok", "error")
+
+
+async def test_noc_brand_field_returns_unsupported(mock_noc):
+    """Brand search is unsupported in the JSON API migration — must return unsupported, not error."""
+    result = await search_noc("Glucophage", field="brand")
+    assert result.status == "unsupported", (
+        f"Expected unsupported for brand search, got {result.status}"
+    )
     # Critical: no uncaught exception.
 
 
@@ -181,16 +185,16 @@ async def test_dpd_no_html_leakage(mock_dpd):
 
 
 async def test_noc_no_html_leakage(mock_noc):
-    result = await search_noc("NORINYL 1/50 21DAY", field="brand")
+    result = await search_noc("METFORMIN HYDROCHLORIDE", field="ingredient")
     assert result.status == "ok"
     for r in result.records:
-        for field, val in (
+        for field_name, val in (
             ("brand_name", r.brand_name),
             ("company", r.company),
             ("ingredient", r.ingredient),
         ):
             if val:
-                _check_no_markup(val, field, repr(r.brand_name))
+                _check_no_markup(val, field_name, repr(r.brand_name))
 
 
 async def test_gsur_no_html_leakage(mock_gsur):

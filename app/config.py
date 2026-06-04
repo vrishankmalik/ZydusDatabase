@@ -34,3 +34,6 @@ USER_AGENT = (
     "+https://github.com/local/canadian-drug-db)"
 )
 HTTP_TIMEOUT = 20.0  # seconds per individual HTTP request
+
+# OCR for scanned product monograph PDFs (requires pdf2image + pytesseract + poppler)
+ENABLE_OCR = bool(int(os.getenv("ENABLE_OCR", "1")))
