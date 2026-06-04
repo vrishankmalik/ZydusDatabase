@@ -261,6 +261,24 @@ Combined view and each per-source tab render results as **collapsible `<details>
 - Every data row in every tab has a `combination` column (the group label). Rows are sorted by combination within each sheet.
 - A `By Combination` summary tab lists each combination with product count, company count, and a comma-separated company list.
 
+## Patent.zip bulk extract (patent enrichment primary source)
+
+URL: `https://pr-rdb.hc-sc.gc.ca/patent/Patent.zip` (note: `/patent/` path, not `/pr-rdb/`)
+
+The ZIP uses a **two-file join** — not a single flat CSV:
+- `drugs_e.txt`: `DRUG_ID → DIN` mapping (columns: `DRUG_ID`, `DIN`, `MEDICINAL_INGREDIENT_E`, `BRAND_NAME_E`, …)
+- `patent-service_e.txt`: `DRUG_ID → PATENT_NUMBER + dates` (columns: `DRUG_ID`, `PATENT_NUMBER`, `FILING_DATE`, `DATE_GRANTED`, `EXPIRATION_DATE`, …)
+
+DIN-to-patent mapping requires joining on `DRUG_ID`. Dates are MM/DD/YYYY (converted to ISO internally). The CPD website (`brevets-patents.ic.gc.ca`) provides cross-check dates but may be unreachable; ZIP dates are the authoritative fallback.
+
+## Register of Innovative Drugs (data protection)
+
+The `id="a1"` attribute is on the `<table>` element itself (not a preceding anchor) — `_find_active_table` returns the table directly. The column "Drug(s) Containing the Medicinal Ingredient / Variations" (col 4) also contains "medicinal ingredient" as a substring; the parser guards against it by requiring the header to **start with** "Medicinal Ingredient".
+
+## pack_style extraction rules
+
+`_extract_pack_style_from_pdf` returns a normalised **container vocab label** (e.g. "Vial", "Blister") — never raw captured text. Hard-reject guard: any captured block containing "the following", "dosage strengths", "dosage form", or any line ending with ":" is discarded. Container vocab patterns accept plural forms (e.g. "blisters" → "Blister").
+
 ## Known Limitations / Gotchas
 
 - **NOC broad searches fail:** The NOC site returns an error for ingredient names that match too many records (>500). The UI surfaces this as an error with a helpful message.

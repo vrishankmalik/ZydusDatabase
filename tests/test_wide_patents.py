@@ -37,26 +37,47 @@ def test_split_empty_string():
 
 # ── _parse_patent_zip_by_din ──────────────────────────────────────────────────
 
-def _make_zip_csv(rows: list[dict], filename: str = "Patent.csv") -> bytes:
+def _make_patent_zip(drug_rows: list, patent_rows: list) -> bytes:
+    """Build a Patent.zip in the real two-file format used by pr-rdb.hc-sc.gc.ca.
+
+    drug_rows:   list of (DRUG_ID, DIN)
+    patent_rows: list of (DRUG_ID, PATENT_NUMBER, FILING_DATE, DATE_GRANTED, EXPIRATION_DATE)
+    """
+    drugs_header = (
+        "DRUG_ID,MEDICINAL_INGREDIENT_E,BRAND_NAME_E,ROUTE_OF_ADMINISTRATION_E,"
+        "STRENGTH_PER_UNIT_E,HUMAN_OR_VET_E,THERAPEUTIC_CLASS,DOSAGE_FORM_E,DIN\n"
+    )
+    drugs_csv = drugs_header + "".join(
+        "%s,Ing,Brand,Oral,100mg,Human,Test,Tablet,%s\n" % (did, din)
+        for did, din in drug_rows
+    )
+    patent_header = (
+        "DRUG_ID,FORM_ID,PATENT_NUMBER,CATEGORY,FILING_DATE,DATE_GRANTED,"
+        "EXPIRATION_DATE,SERVICE_COMPANY_NAME_E,FIRST_NAME,LAST_NAME,"
+        "POSITION_TITLE,ADDRESS,CITY_NAME_E,PROVINCE_NAME_E,POSTAL_CODE\n"
+    )
+    patent_csv = patent_header + "".join(
+        "%s,999,%s,C,%s,%s,%s,Co,,,,,Toronto,ONTARIO,M5V1A1\n" % (did, pn, fd, gd, ed)
+        for did, pn, fd, gd, ed in patent_rows
+    )
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        csv_buf = io.StringIO()
-        if rows:
-            writer = csv.DictWriter(csv_buf, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-        zf.writestr(filename, csv_buf.getvalue())
+        zf.writestr("drugs_e.txt", drugs_csv)
+        zf.writestr("patent-service_e.txt", patent_csv)
     return buf.getvalue()
 
 
 def test_parse_patent_zip_by_din_basic():
     from app.enrichment.patents import _parse_patent_zip_by_din
 
-    zip_bytes = _make_zip_csv([
-        {"DIN": "02322285", "PATENT_NO": "2645810", "FILING_DATE": "2008-12-10"},
-        {"DIN": "02322285", "PATENT_NO": "3022097", "FILING_DATE": "2015-06-01"},
-        {"DIN": "02498014", "PATENT_NO": "2709025", "FILING_DATE": "2008-12-10"},
-    ])
+    zip_bytes = _make_patent_zip(
+        drug_rows=[("1", "02322285"), ("2", "02498014")],
+        patent_rows=[
+            ("1", "2645810", "12/10/2008", "08/26/2014", "12/10/2028"),
+            ("1", "3022097", "06/01/2015", "01/01/2020", "06/01/2035"),
+            ("2", "2709025", "12/10/2008", "08/26/2014", "12/10/2028"),
+        ],
+    )
     result = _parse_patent_zip_by_din(zip_bytes)
 
     assert "02322285" in result
@@ -68,9 +89,10 @@ def test_parse_patent_zip_by_din_basic():
 def test_parse_patent_zip_by_din_pads_din_to_8_digits():
     from app.enrichment.patents import _parse_patent_zip_by_din
 
-    zip_bytes = _make_zip_csv([
-        {"DIN": "2322285", "PATENT_NO": "9999999"},  # 7-digit — should pad to "02322285"
-    ])
+    zip_bytes = _make_patent_zip(
+        drug_rows=[("1", "2322285")],   # 7-digit — should pad to "02322285"
+        patent_rows=[("1", "9999999", "", "", "")],
+    )
     result = _parse_patent_zip_by_din(zip_bytes)
     assert "02322285" in result
 
@@ -78,9 +100,10 @@ def test_parse_patent_zip_by_din_pads_din_to_8_digits():
 def test_parse_patent_zip_by_din_defensive_split_on_merged():
     from app.enrichment.patents import _parse_patent_zip_by_din
 
-    zip_bytes = _make_zip_csv([
-        {"DIN": "02322285", "PATENT_NO": "26458103022097"},  # merged 14-digit
-    ])
+    zip_bytes = _make_patent_zip(
+        drug_rows=[("1", "02322285")],
+        patent_rows=[("1", "26458103022097", "", "", "")],  # merged 14-digit
+    )
     result = _parse_patent_zip_by_din(zip_bytes)
     assert "02322285" in result
     assert set(result["02322285"]) == {"2645810", "3022097"}
@@ -91,7 +114,7 @@ def test_parse_patent_zip_by_din_empty_zip():
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("README.txt", "no csv here")
+        zf.writestr("README.txt", "no patent files here")
     result = _parse_patent_zip_by_din(buf.getvalue())
     assert result == {}
 

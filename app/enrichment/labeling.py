@@ -108,9 +108,11 @@ _CONTAINER_VOCAB_ORDERED: list[tuple[str, str]] = [
     ("KIT", "Kit"),
 ]
 
-# Pre-built regex patterns for speed (word-boundary anchored, case-insensitive)
+# Pre-built regex patterns for speed (word-boundary anchored, case-insensitive).
+# Optional trailing 'S' allows matching plural forms (e.g. "vials", "blisters",
+# "blister packs") without requiring an exact word boundary after the keyword root.
 _CONTAINER_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\b" + re.escape(kw) + r"\b", re.IGNORECASE), label)
+    (re.compile(r"\b" + re.escape(kw) + r"S?\b", re.IGNORECASE), label)
     for kw, label in _CONTAINER_VOCAB_ORDERED
 ]
 
@@ -836,26 +838,33 @@ def _extract_excipients_regex(s6_text: str) -> tuple[Optional[str], Optional[str
 
 
 _PACK_STYLE_HEADING_REJECT = re.compile(
-    r"the following dosage strengths|dosage strengths|:\s*$|^\s*dosage\s+form",
+    r"the following|dosage strengths|dosage\s+form",
     re.IGNORECASE,
 )
 
+# A captured block is also rejected when any line ends with ":" (heading fragment)
+_TRAILING_COLON_RE = re.compile(r":\s*$", re.MULTILINE)
+
 
 def _extract_pack_style_from_pdf(s6_text: str) -> Optional[str]:
-    """Extract packaging description from §6 Packaging subsection.
+    """Extract a container-type label from the §6 Packaging subsection.
 
-    Only returns a value when it:
-      (a) contains a container-vocabulary keyword, AND
-      (b) is not a section heading / dosage-strengths fragment.
+    Returns a Title-Case container label (e.g. "Bottle", "Vial") or None.
+    Raw captured text is never returned — only the normalised container label.
+    Stage 2 (DPD API) overrides this value in enrich_labeling.
 
-    Stage 2 (DPD API) overrides this in enrich_labeling.
+    Reject rules (applied before returning):
+      (a) any captured block containing "the following", "dosage strengths",
+          or "dosage form" is a heading fragment — skip.
+      (b) any captured block where any line ends with ":" is a heading fragment — skip.
+      (c) the block must contain at least one container-vocabulary keyword.
     """
     pats = [
         # "Packaging" on its own line, followed by content
         r"(?m)^Packaging\s*$\n(.+?)(?=\n\n|\n[A-Z\d]|\Z)",
         # "Packaging:" as a label
         r"(?m)^Packaging\s*:\s*(.+?)(?=\n\n|\n[A-Z\d]|\Z)",
-        # "provided in ..." sentence
+        # "provided/available in ..." sentence
         r"(?:provided|available)\s+in\s+(.+?)(?:\.|;|\n|$)",
     ]
     for pat in pats:
@@ -865,12 +874,17 @@ def _extract_pack_style_from_pdf(s6_text: str) -> Optional[str]:
         val = m.group(1).strip()
         if len(val) <= 5:
             continue
-        # Hard reject: heading fragments and missing container keyword
+        # Hard reject: heading/dosage fragments
         if _PACK_STYLE_HEADING_REJECT.search(val):
             continue
-        if not _extract_pack_style_from_text(val):
+        # Hard reject: any line ending with ":" (section headings bleed in)
+        if _TRAILING_COLON_RE.search(val):
             continue
-        return val
+        # Require a container keyword — return the normalised label, never raw text
+        label = _extract_pack_style_from_text(val)
+        if not label:
+            continue
+        return label
     return None
 
 

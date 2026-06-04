@@ -48,28 +48,64 @@ def test_parse_detail_page_missing_fields_returns_none():
 
 # ── unit: Patent.zip parsing ──────────────────────────────────────────────────
 
-def test_parse_patent_zip_reads_csv():
-    from app.enrichment.patents import _parse_patent_zip
-    import io, zipfile, csv
+def _make_patent_zip(drug_rows: list, patent_rows: list) -> bytes:
+    """Build a minimal Patent.zip in the real two-file format.
 
-    # Build a minimal in-memory zip with a CSV
-    csv_content = (
-        "PATENT_NO,FILING_DATE,DATE_GRANTED,EXPIRY_DATE\n"
-        "2709025,2008-12-10,2014-08-26,2028-12-10\n"
-        "9999999,2001-01-01,,2021-01-01\n"
+    drug_rows:   list of (DRUG_ID, DIN)
+    patent_rows: list of (DRUG_ID, PATENT_NUMBER, FILING_DATE, DATE_GRANTED, EXPIRATION_DATE)
+    """
+    import io, zipfile
+
+    drugs_header = "DRUG_ID,MEDICINAL_INGREDIENT_E,BRAND_NAME_E,ROUTE_OF_ADMINISTRATION_E,STRENGTH_PER_UNIT_E,HUMAN_OR_VET_E,THERAPEUTIC_CLASS,DOSAGE_FORM_E,DIN\n"
+    drugs_csv = drugs_header + "".join(
+        "%s,TestIngredient,TestBrand,Oral,100mg,Human,Test,Tablet,%s\n" % (did, din)
+        for did, din in drug_rows
+    )
+    patent_header = "DRUG_ID,FORM_ID,PATENT_NUMBER,CATEGORY,FILING_DATE,DATE_GRANTED,EXPIRATION_DATE,SERVICE_COMPANY_NAME_E,FIRST_NAME,LAST_NAME,POSITION_TITLE,ADDRESS,CITY_NAME_E,PROVINCE_NAME_E,POSTAL_CODE\n"
+    patent_csv = patent_header + "".join(
+        "%s,999,%s,C,%s,%s,%s,TestCo,,,,,Toronto,ONTARIO,M5V1A1\n" % (did, pn, fd, gd, ed)
+        for did, pn, fd, gd, ed in patent_rows
     )
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("Patent.csv", csv_content)
-    zip_bytes = buf.getvalue()
+        zf.writestr("drugs_e.txt", drugs_csv)
+        zf.writestr("patent-service_e.txt", patent_csv)
+    return buf.getvalue()
 
+
+def test_parse_patent_zip_reads_correct_files():
+    """_parse_patent_zip uses patent-service_e.txt with MM/DD/YYYY dates."""
+    from app.enrichment.patents import _parse_patent_zip
+
+    zip_bytes = _make_patent_zip(
+        drug_rows=[("100", "02709025")],
+        patent_rows=[("100", "2709025", "12/10/2008", "08/26/2014", "12/10/2028")],
+    )
     result = _parse_patent_zip(zip_bytes)
 
     assert "2709025" in result
     assert result["2709025"]["filing_date"] == "2008-12-10"
     assert result["2709025"]["grant_date"] == "2014-08-26"
     assert result["2709025"]["expiry_date"] == "2028-12-10"
-    assert result["9999999"]["grant_date"] is None or result["9999999"]["grant_date"] == ""
+
+
+def test_parse_patent_zip_by_din_joins_correctly():
+    """_parse_patent_zip_by_din joins drugs_e.txt → patent-service_e.txt by DRUG_ID."""
+    from app.enrichment.patents import _parse_patent_zip_by_din
+
+    zip_bytes = _make_patent_zip(
+        drug_rows=[("100", "02709025"), ("101", "09999999")],
+        patent_rows=[
+            ("100", "2709025", "12/10/2008", "08/26/2014", "12/10/2028"),
+            ("101", "9999999", "01/01/2001", "", "01/01/2021"),
+        ],
+    )
+    result = _parse_patent_zip_by_din(zip_bytes)
+
+    assert "02709025" in result
+    assert "2709025" in result["02709025"]
+    assert "09999999" in result
+    assert "9999999" in result["09999999"]
 
 
 def test_parse_patent_zip_empty_returns_empty():
@@ -78,7 +114,7 @@ def test_parse_patent_zip_empty_returns_empty():
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("README.txt", "no csv here")
+        zf.writestr("README.txt", "no patent-service_e.txt here")
     result = _parse_patent_zip(buf.getvalue())
     assert result == {}
 
@@ -207,3 +243,51 @@ async def test_live_patent_detail_has_dates():
     assert expiry is not None, "Expected expiry_date from live Patent Register"
     import re
     assert re.match(r"\d{4}[-/]\d{2}[-/]\d{2}", expiry), f"Unexpected date format: {expiry}"
+
+
+# ── regression: Bug 1 — Patent.zip two-file join ─────────────────────────────
+
+def test_patent_zip_url_is_correct():
+    """Patent.zip URL must use /patent/ path, not /pr-rdb/ (was 404)."""
+    from app.enrichment.patents import _PATENT_ZIP_URL
+    assert "/patent/Patent.zip" in _PATENT_ZIP_URL, (
+        f"Patent.zip URL should contain /patent/Patent.zip, got: {_PATENT_ZIP_URL}"
+    )
+
+
+def test_parse_zip_date_handles_us_format():
+    """Patent.zip dates are MM/DD/YYYY; must parse to YYYY-MM-DD."""
+    from app.enrichment.patents import _parse_zip_date
+    assert _parse_zip_date("03/23/2007") == "2007-03-23"
+    assert _parse_zip_date("12/10/2028") == "2028-12-10"
+    assert _parse_zip_date("") is None
+    assert _parse_zip_date(None) is None
+
+
+def test_parse_patent_zip_dates_from_patent_service_file():
+    """_parse_patent_zip reads PATENT_NUMBER+dates from patent-service_e.txt."""
+    from app.enrichment.patents import _parse_patent_zip
+
+    zip_bytes = _make_patent_zip(
+        drug_rows=[("5556", "02562383")],
+        patent_rows=[("5556", "2630344", "03/23/2007", "04/28/2015", "03/23/2027")],
+    )
+    result = _parse_patent_zip(zip_bytes)
+    assert "2630344" in result
+    assert result["2630344"]["filing_date"] == "2007-03-23"
+    assert result["2630344"]["grant_date"] == "2015-04-28"
+    assert result["2630344"]["expiry_date"] == "2027-03-23"
+
+
+def test_parse_patent_zip_by_din_uses_drug_id_join():
+    """DIN→patent mapping requires the DRUG_ID join; DIN alone in wrong file is insufficient."""
+    from app.enrichment.patents import _parse_patent_zip_by_din
+
+    # Lecanemab: DRUG_ID=5556, DIN=02562383, patent=2630344
+    zip_bytes = _make_patent_zip(
+        drug_rows=[("5556", "02562383")],
+        patent_rows=[("5556", "2630344", "03/23/2007", "04/28/2015", "03/23/2027")],
+    )
+    result = _parse_patent_zip_by_din(zip_bytes)
+    assert "02562383" in result
+    assert "2630344" in result["02562383"]

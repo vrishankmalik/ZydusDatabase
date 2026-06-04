@@ -100,15 +100,18 @@ class TestPiqrayGolden:
 
     # ── packaging ────────────────────────────────────────────────────────────
 
-    def test_pack_style_contains_blisters(self):
-        from app.enrichment.labeling import NOT_STATED
+    def test_pack_style_is_blister_label(self):
+        # _extract_pack_style_from_pdf now returns the normalised container vocab label
+        # (e.g. "Blister" or "Blister Pack") rather than raw captured text.
+        # PIQRAY is packaged in PVC/PCTFE blisters → expect a blister-family label.
+        from app.enrichment.labeling import NOT_STATED, NOT_IN_PM
         style = self.row_50["pack_style"]
-        assert style != NOT_STATED, "Pack style should be extracted"
-        assert "blister" in style.lower(), f"Expected 'blister' in pack_style, got: {style!r}"
-
-    def test_pack_style_contains_aluminium(self):
-        style = self.row_50["pack_style"]
-        assert "alumin" in style.lower(), f"Expected 'alumin*' in pack_style, got: {style!r}"
+        assert style not in (NOT_STATED, NOT_IN_PM, None), (
+            "Pack style should be extracted for PIQRAY"
+        )
+        assert "blister" in style.lower(), (
+            f"Expected a blister-family label for PIQRAY pack_style, got: {style!r}"
+        )
 
     # ── per-strength colours ──────────────────────────────────────────────────
 
@@ -297,3 +300,52 @@ def test_ph_absent_gives_not_stated():
     s13 = "13 PHARMACEUTICAL INFORMATION\nMolecular weight: 441 g/mol"
     result = _extract_ph(s13)
     assert result == NOT_STATED
+
+
+# ── regression: Bug 3 — pack_style must never emit heading fragments ──────────
+
+class TestPackStyleNeverHeadingFragment:
+    """_extract_pack_style_from_pdf must never return raw heading text.
+    
+    Regression for the bug where pack_style was set to strings like
+    'the following dosage strengths:', 'the following', or 'below pack sizes:'
+    from §6 Packaging sections that began with dosage-listing headings.
+    """
+
+    def test_rejects_the_following_dosage_strengths(self):
+        from app.enrichment.labeling import _extract_pack_style_from_pdf
+        text = "Packaging\nAvailable in the following dosage strengths:\n500 mg bottle"
+        result = _extract_pack_style_from_pdf(text)
+        assert result is None or "following" not in result.lower(), (
+            f"'the following dosage strengths' must not appear in pack_style, got: {result!r}"
+        )
+
+    def test_rejects_the_following_alone(self):
+        from app.enrichment.labeling import _extract_pack_style_from_pdf
+        text = "Packaging\nAvailable in the following\nbottles of 100 tablets"
+        result = _extract_pack_style_from_pdf(text)
+        assert result is None or "following" not in result.lower(), (
+            f"'the following' must not appear in pack_style, got: {result!r}"
+        )
+
+    def test_rejects_trailing_colon(self):
+        from app.enrichment.labeling import _extract_pack_style_from_pdf
+        text = "Packaging\nbelow pack sizes:\n500 mg per bottle"
+        result = _extract_pack_style_from_pdf(text)
+        assert result is None or not result.strip().endswith(":"), (
+            f"pack_style must not end with ':', got: {result!r}"
+        )
+
+    def test_returns_label_not_raw_text(self):
+        from app.enrichment.labeling import _extract_pack_style_from_pdf, _CONTAINER_VOCAB_ORDERED
+        valid_labels = {label for _, label in _CONTAINER_VOCAB_ORDERED}
+        text = "Packaging\nAvailable in vial of 10 mL."
+        result = _extract_pack_style_from_pdf(text)
+        assert result in valid_labels, (
+            f"_extract_pack_style_from_pdf must return a container label or None, got: {result!r}"
+        )
+
+    def test_valid_container_still_returned(self):
+        from app.enrichment.labeling import _extract_pack_style_from_pdf
+        assert _extract_pack_style_from_pdf("Packaging\nEach vial contains 100 mg.") == "Vial"
+        assert _extract_pack_style_from_pdf("Packaging\nPrefilled syringe of 2 mL.") == "Prefilled Syringe"

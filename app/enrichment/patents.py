@@ -46,7 +46,8 @@ from app.sources.patent_register import (
 logger = logging.getLogger(__name__)
 
 _BASE_HOST = "https://pr-rdb.hc-sc.gc.ca"
-_PATENT_ZIP_URL = f"{PATENT_BASE}/Patent.zip"
+# Patent.zip lives under /patent/, not /pr-rdb/ — separate from the PATENT_BASE search URL
+_PATENT_ZIP_URL = f"{_BASE_HOST}/patent/Patent.zip"
 _PR_DETAIL_URL = f"{_BASE_HOST}/pr-rdb/patentDetails"
 
 # Canadian Patents Database — authoritative source for filing/grant/expiry dates
@@ -392,44 +393,49 @@ async def load_patent_zip() -> dict[str, dict[str, Optional[str]]]:
     return _parse_patent_zip(zip_bytes)
 
 
+def _parse_zip_date(raw: Optional[str]) -> Optional[str]:
+    """Parse a Patent.zip date (MM/DD/YYYY) to ISO YYYY-MM-DD.
+
+    Dates in patent-service_e.txt are formatted as MM/DD/YYYY (US-style).
+    """
+    if not raw or not raw.strip():
+        return None
+    raw = raw.strip()
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", raw)
+    if m:
+        return f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+    return _parse_cpd_date(raw)
+
+
 def _parse_patent_zip(zip_bytes: bytes) -> dict[str, dict[str, Optional[str]]]:
+    """Parse Patent.zip and return {patent_number → {filing_date, grant_date, expiry_date}}.
+
+    Uses patent-service_e.txt (PATENT_NUMBER, FILING_DATE, DATE_GRANTED, EXPIRATION_DATE).
+    Dates are MM/DD/YYYY in the bulk extract; converted to ISO YYYY-MM-DD.
+    """
     result: dict[str, dict[str, Optional[str]]] = {}
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-            for csv_name in csv_names:
-                with zf.open(csv_name) as raw_f:
-                    f = io.TextIOWrapper(raw_f, encoding="utf-8-sig", errors="replace")
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        pn = (
-                            row.get("PATENT_NO")
-                            or row.get("Patent Number")
-                            or row.get("patent_number")
-                            or ""
-                        ).strip()
-                        if not pn:
-                            continue
-                        result[_clean_patent_number(pn)] = {
-                            "filing_date": (
-                                row.get("FILING_DATE")
-                                or row.get("Filing Date")
-                                or row.get("filing_date")
-                                or None
-                            ),
-                            "grant_date": (
-                                row.get("DATE_GRANTED")
-                                or row.get("Date Granted")
-                                or row.get("grant_date")
-                                or None
-                            ),
-                            "expiry_date": (
-                                row.get("EXPIRY_DATE")
-                                or row.get("Expiry Date")
-                                or row.get("expiry_date")
-                                or None
-                            ),
-                        }
+            names_lower = {n.lower(): n for n in zf.namelist()}
+            patent_file = names_lower.get("patent-service_e.txt")
+            if not patent_file:
+                logger.warning("Patent.zip: patent-service_e.txt not found; files: %s", zf.namelist())
+                return {}
+            with zf.open(patent_file) as raw_f:
+                f = io.TextIOWrapper(raw_f, encoding="utf-8-sig", errors="replace")
+                reader = csv.DictReader(f)
+                for row in reader:
+                    pn = (row.get("PATENT_NUMBER") or "").strip()
+                    if not pn:
+                        continue
+                    clean_pn = _clean_patent_number(pn)
+                    if not clean_pn:
+                        continue
+                    result[clean_pn] = {
+                        "filing_date": _parse_zip_date(row.get("FILING_DATE")),
+                        "grant_date": _parse_zip_date(row.get("DATE_GRANTED")),
+                        "expiry_date": _parse_zip_date(row.get("EXPIRATION_DATE")),
+                    }
     except Exception as exc:
         logger.warning("Patent.zip parse failed: %s", exc)
         return {}
@@ -441,50 +447,62 @@ def _parse_patent_zip(zip_bytes: bytes) -> dict[str, dict[str, Optional[str]]]:
 def _parse_patent_zip_by_din(zip_bytes: bytes) -> dict[str, list[str]]:
     """Parse Patent.zip and return {DIN (8-digit zero-padded) → [patent_numbers]}.
 
-    Each row in the CSV is one DIN-patent pair, so grouping by DIN gives a clean
-    per-DIN list with no string-concatenation artefacts.
+    The ZIP uses a two-file join:
+      drugs_e.txt          — DRUG_ID → DIN mapping
+      patent-service_e.txt — DRUG_ID → PATENT_NUMBER (one row per DIN-patent pair)
+
+    The two files are joined on DRUG_ID to produce the DIN → patent list.
     """
     result: dict[str, list[str]] = {}
     if not zip_bytes:
         return result
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-            csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
-            for csv_name in csv_names:
-                with zf.open(csv_name) as raw_f:
-                    f = io.TextIOWrapper(raw_f, encoding="utf-8-sig", errors="replace")
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        raw_din = (
-                            row.get("DIN")
-                            or row.get("din")
-                            or row.get("Drug Identification Number")
-                            or row.get("DRUG_ID_NO")
-                            or row.get("DRUG_IDENTIFICATION_NUMBER")
-                            or row.get("din_number")
-                            or ""
-                        ).strip()
-                        raw_pn = (
-                            row.get("PATENT_NO")
-                            or row.get("Patent Number")
-                            or row.get("patent_number")
-                            or row.get("PATENT_NUMBER")
-                            or ""
-                        ).strip()
-                        if not raw_din or not raw_pn:
-                            continue
-                        # Normalize DIN to 8-digit string
-                        try:
-                            din = str(int(raw_din)).zfill(8)
-                        except ValueError:
-                            din = re.sub(r"[^0-9]", "", raw_din).zfill(8)
-                        if not din.strip("0"):
-                            continue  # skip all-zero placeholder
-                        # Apply defensive split on each patent token
-                        for pn in _split_merged_patent_number(raw_pn):
-                            bucket = result.setdefault(din, [])
-                            if pn not in bucket:
-                                bucket.append(pn)
+            names_lower = {n.lower(): n for n in zf.namelist()}
+
+            # Step 1: build DRUG_ID → DIN from drugs_e.txt
+            drug_id_to_din: dict[str, str] = {}
+            drugs_file = names_lower.get("drugs_e.txt")
+            if not drugs_file:
+                logger.warning("Patent.zip: drugs_e.txt not found; files: %s", zf.namelist())
+                return result
+            with zf.open(drugs_file) as raw_f:
+                f = io.TextIOWrapper(raw_f, encoding="utf-8-sig", errors="replace")
+                reader = csv.DictReader(f)
+                for row in reader:
+                    did = (row.get("DRUG_ID") or "").strip()
+                    raw_din = (row.get("DIN") or "").strip()
+                    if not did or not raw_din:
+                        continue
+                    try:
+                        din_norm = str(int(raw_din)).zfill(8)
+                    except ValueError:
+                        din_norm = re.sub(r"[^0-9]", "", raw_din).zfill(8)
+                    if not din_norm.strip("0"):
+                        continue
+                    drug_id_to_din[did] = din_norm
+            logger.debug("Patent.zip: built DRUG_ID→DIN map with %d entries", len(drug_id_to_din))
+
+            # Step 2: build DIN → [patent_numbers] from patent-service_e.txt via DRUG_ID join
+            patent_file = names_lower.get("patent-service_e.txt")
+            if not patent_file:
+                logger.warning("Patent.zip: patent-service_e.txt not found; files: %s", zf.namelist())
+                return result
+            with zf.open(patent_file) as raw_f:
+                f = io.TextIOWrapper(raw_f, encoding="utf-8-sig", errors="replace")
+                reader = csv.DictReader(f)
+                for row in reader:
+                    did = (row.get("DRUG_ID") or "").strip()
+                    raw_pn = (row.get("PATENT_NUMBER") or "").strip()
+                    if not did or not raw_pn:
+                        continue
+                    din = drug_id_to_din.get(did)
+                    if not din:
+                        continue
+                    for pn in _split_merged_patent_number(raw_pn):
+                        bucket = result.setdefault(din, [])
+                        if pn not in bucket:
+                            bucket.append(pn)
     except Exception as exc:
         logger.warning("Patent.zip by-DIN parse failed: %s", exc)
     return result

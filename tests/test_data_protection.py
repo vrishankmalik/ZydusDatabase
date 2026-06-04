@@ -214,3 +214,73 @@ def test_pediatric_extension_only_y_n_blank_in_output(tmp_path):
         assert str(val) in ("Y", "N", "", "None", "nan"), (
             f"pediatric_extension must be Y/N/blank, got: {val!r}"
         )
+
+
+# ── regression: Bug 2 — id="a1" is on the table itself ───────────────────────
+
+def test_find_active_table_when_id_is_on_table_itself():
+    """When id='a1' is on the <table> element, return that table directly
+    (not the next sibling, which would be the expired-period table)."""
+    from bs4 import BeautifulSoup
+    from app.enrichment.data_protection import _find_active_table
+
+    html = """
+    <html><body>
+      <table id="a1">
+        <tr><th>Medicinal Ingredient(s)</th><th>Manufacturer</th>
+            <th>6 Year No File Date</th><th>Pediatric Extension Yes/No</th>
+            <th>Data Protection Ends</th></tr>
+        <tr><td>alpelisib</td><td>Novartis</td>
+            <td>2025-05-24</td><td>No</td><td>2025-05-24</td></tr>
+      </table>
+      <table id="a2">
+        <tr><th>Medicinal Ingredient(s)</th><th>Manufacturer</th></tr>
+        <tr><td>WRONG TABLE</td><td>Should not be returned</td></tr>
+      </table>
+    </body></html>
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    tbl = _find_active_table(soup)
+    assert tbl is not None
+    assert tbl.get("id") == "a1", f"Expected id='a1', got: {tbl.get('id')!r}"
+    # Confirm it's the active table, not the expired one
+    text = tbl.get_text()
+    assert "alpelisib" in text
+    assert "WRONG TABLE" not in text
+
+
+def test_medicinal_ingredient_column_not_overwritten_by_containing_drug_column():
+    """Column index for 'medicinal_ingredient' must not be overwritten by the
+    'Drug(s) Containing the Medicinal Ingredient...' header (which also contains
+    'medicinal ingredient' as a substring)."""
+    from bs4 import BeautifulSoup
+    from app.enrichment.data_protection import _parse_data_protection_table
+
+    html = """<table>
+      <tr>
+        <th>Medicinal Ingredient(s) Footnote 1</th>
+        <th>Submission Number</th>
+        <th>Innovative Drug</th>
+        <th>Manufacturer</th>
+        <th>Drug(s) Containing the Medicinal Ingredient / Variations</th>
+        <th>Notice of Compliance Date yyyy-mm-dd</th>
+        <th>6 Year "No File" Date</th>
+        <th>Pediatric Extension Yes/No</th>
+        <th>Data Protection Ends</th>
+      </tr>
+      <tr>
+        <td>clesrovimab</td><td>295182</td><td>Enflonsia</td>
+        <td>Merck Canada Inc.</td><td>N/A</td><td>2026-01-30</td>
+        <td>2032-01-30</td><td>Yes</td><td>2034-07-30</td>
+      </tr>
+    </table>"""
+    soup = BeautifulSoup(html, "html.parser")
+    tbl = soup.find("table")
+    rows = _parse_data_protection_table(tbl)
+    assert rows, "Expected at least one row"
+    assert rows[0]["medicinal_ingredient"] == "clesrovimab", (
+        f"medicinal_ingredient should be 'clesrovimab', got: {rows[0]['medicinal_ingredient']!r}"
+    )
+    assert rows[0]["manufacturer"] == "Merck Canada Inc."
+    assert rows[0]["no_file_date"] == "2032-01-30"
+    assert rows[0]["data_protection_ends"] == "2034-07-30"

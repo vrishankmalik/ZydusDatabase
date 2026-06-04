@@ -82,10 +82,13 @@ def _find_active_table(soup: BeautifulSoup) -> Optional[object]:
          — those headings typically contain "veterinary" or "animals")
       4. Column-header heuristic: table with both "medicinal" and "data protection" headers
     """
-    # 1. Named anchor #a1
-    anchor = soup.find(id="a1")
-    if anchor:
-        tbl = anchor.find_next("table")
+    # 1. Element with id="a1" — may be the <table> itself (current page layout)
+    #    or an <a> anchor immediately before the table (older layout).
+    el = soup.find(id="a1")
+    if el:
+        if el.name == "table":
+            return el          # id is directly on the table — return it as-is
+        tbl = el.find_next("table")
         if tbl:
             return tbl
 
@@ -134,7 +137,10 @@ def _parse_data_protection_table(table) -> list[dict]:
 
     col: dict[str, int] = {}
     for i, h in enumerate(headers):
-        if "medicinal ingredient" in h:
+        # Guard: "Drug(s) Containing the Medicinal Ingredient" also contains
+        # "medicinal ingredient" — exclude it by requiring the header to START with
+        # the phrase (not merely contain it as part of a longer description).
+        if "medicinal ingredient" in h and h.startswith("medicinal ingredient"):
             col["medicinal_ingredient"] = i
         elif "submission number" in h:
             col["submission_number"] = i
