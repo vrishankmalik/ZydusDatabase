@@ -1022,6 +1022,7 @@ _DESC_END = [r"[Cc]omposition", r"[Pp]ackaging", r"[Ss]torage", r"\n\n\n"]
 async def parse_labeling_fields_async(
     pages: list[tuple[int, str]],
     din_strength: Optional[str],
+    enable_llm: bool = True,
 ) -> dict:
     """Extract Stage 3 label fields from pre-extracted PDF pages.
 
@@ -1050,7 +1051,7 @@ async def parse_labeling_fields_async(
     desc_page = desc_section[0] if desc_section else s6_page
     desc_text = desc_section[1] if desc_section else s6_text
 
-    use_ollama = await _is_ollama_available()
+    use_ollama = enable_llm and await _is_ollama_available()
 
     if use_ollama:
         # --- Ollama path ---
@@ -1153,6 +1154,8 @@ async def enrich_labeling(
     drug_code: int,
     strength: Optional[str],
     pdf_bytes: Optional[bytes] = None,
+    enable_ocr: Optional[bool] = None,
+    enable_llm: bool = True,
 ) -> Optional[dict]:
     """Enrich a single DIN: Stage 2 (DPD API) then Stage 3 (PDF + OCR if needed).
 
@@ -1187,10 +1190,11 @@ async def enrich_labeling(
             return row
 
     # Stage 3: PDF extraction — OCR applied per-page when text layer is thin
+    ocr_flag = ENABLE_OCR if enable_ocr is None else enable_ocr
     try:
         cache_key = pdf_url or f"pdf_bytes:{din}"
         pages, ocr_used = _extract_text_with_ocr(
-            pdf_bytes, cache_key=cache_key, enable_ocr=ENABLE_OCR,
+            pdf_bytes, cache_key=cache_key, enable_ocr=ocr_flag,
         )
     except ImportError:
         logger.error("pdfplumber is not installed — cannot extract labeling fields.")
@@ -1199,7 +1203,7 @@ async def enrich_labeling(
         logger.warning("PDF parse failed for din=%s: %s", din, exc)
         return None
 
-    pdf_row = await parse_labeling_fields_async(pages, strength)
+    pdf_row = await parse_labeling_fields_async(pages, strength, enable_llm=enable_llm)
 
     # Mark OCR usage
     if ocr_used:
@@ -1229,10 +1233,12 @@ async def enrich_labeling(
 
 async def enrich_labeling_batch(
     din_map: dict[str, tuple[int, Optional[str]]],
+    enable_ocr: Optional[bool] = None,
+    enable_llm: bool = True,
 ) -> dict[str, Optional[dict]]:
     """Enrich labeling for multiple DINs. din_map: {din → (drug_code, strength)}"""
     results = await asyncio.gather(*[
-        enrich_labeling(din, drug_code, strength)
+        enrich_labeling(din, drug_code, strength, enable_ocr=enable_ocr, enable_llm=enable_llm)
         for din, (drug_code, strength) in din_map.items()
     ])
     return dict(zip(din_map.keys(), results))

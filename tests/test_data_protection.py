@@ -3,7 +3,7 @@
 Covers:
   - Ingredient and manufacturer normalisation
   - Deterministic matching (exact + fuzzy)
-  - _extract_dp_fields (pediatric_extension → Y/N)
+  - _extract_dp_fields (pediatric_extension → Yes/No; N/A → No)
   - Offline fallback: Ollama unavailable → deterministic path used
   - No match → empty dict (no fabrication)
   - Async match_data_protection with mocked Ollama online/offline
@@ -56,25 +56,37 @@ def test_normalize_manufacturer_casefolded():
 
 # ── _extract_dp_fields ────────────────────────────────────────────────────────
 
-def test_extract_dp_fields_yes_becomes_y():
+def test_extract_dp_fields_yes_becomes_yes():
     from app.enrichment.data_protection import _extract_dp_fields
     row = {"pediatric_extension": "Yes", "no_file_date": "2025-05-24", "data_protection_ends": "2027-05-24"}
     result = _extract_dp_fields(row)
-    assert result["pediatric_extension"] == "Y"
+    assert result["pediatric_extension"] == "Yes"
 
 
-def test_extract_dp_fields_no_becomes_n():
+def test_extract_dp_fields_no_becomes_no():
     from app.enrichment.data_protection import _extract_dp_fields
     row = {"pediatric_extension": "No", "no_file_date": "2025-01-01", "data_protection_ends": "2027-01-01"}
     result = _extract_dp_fields(row)
-    assert result["pediatric_extension"] == "N"
+    assert result["pediatric_extension"] == "No"
 
 
-def test_extract_dp_fields_unknown_ped_becomes_blank():
+def test_extract_dp_fields_na_becomes_no():
+    """N/A in the Register cell must map to 'No', not blank."""
+    from app.enrichment.data_protection import _extract_dp_fields
+    for na_value in ("N/A", "n/a", "-", "", "  "):
+        row = {"pediatric_extension": na_value, "no_file_date": "X", "data_protection_ends": "X"}
+        result = _extract_dp_fields(row)
+        assert result["pediatric_extension"] == "No", (
+            f"Expected 'No' for pediatric_extension={na_value!r}, got {result['pediatric_extension']!r}"
+        )
+
+
+def test_extract_dp_fields_unknown_ped_becomes_no():
+    """Unrecognised values default to 'No' (not blank)."""
     from app.enrichment.data_protection import _extract_dp_fields
     row = {"pediatric_extension": "maybe", "no_file_date": "X", "data_protection_ends": "X"}
     result = _extract_dp_fields(row)
-    assert result["pediatric_extension"] == ""
+    assert result["pediatric_extension"] == "No"
 
 
 def test_extract_dp_fields_keys_present():
@@ -112,7 +124,7 @@ def test_deterministic_match_exact_ingredient_and_manufacturer():
         "alpelisib 50 mg", "Novartis Pharmaceuticals Canada Inc.", _SAMPLE_TABLE
     )
     assert result["dp_6yr_no_file_date"] == "2025-05-24"
-    assert result["pediatric_extension"] == "N"
+    assert result["pediatric_extension"] == "No"
     assert result["data_protection_ends"] == "2025-05-24"
 
 
@@ -162,7 +174,7 @@ async def test_match_data_protection_offline_uses_deterministic(monkeypatch):
         "Alexion Pharmaceuticals Inc.",
         _SAMPLE_TABLE,
     )
-    assert result["pediatric_extension"] == "Y"
+    assert result["pediatric_extension"] == "Yes"
     assert result["dp_6yr_no_file_date"] == "2021-06-02"
 
 
@@ -198,8 +210,8 @@ async def test_match_data_protection_empty_table_returns_empty(monkeypatch):
 
 # ── pediatric_extension in workbook output ────────────────────────────────────
 
-def test_pediatric_extension_only_y_n_blank_in_output(tmp_path):
-    """build_sheet1 with dp_table: pediatric_extension is only Y, N, or blank."""
+def test_pediatric_extension_only_yes_no_in_output(tmp_path):
+    """build_sheet1 with dp_table: pediatric_extension is only 'Yes' or 'No'."""
     import app.enrichment.store as store_mod
     store_mod.reset_for_testing(str(tmp_path / "enrich.db"))
 
@@ -211,8 +223,8 @@ def test_pediatric_extension_only_y_n_blank_in_output(tmp_path):
 
     assert "pediatric_extension" in df.columns
     for val in df["pediatric_extension"].fillna(""):
-        assert str(val) in ("Y", "N", "", "None", "nan"), (
-            f"pediatric_extension must be Y/N/blank, got: {val!r}"
+        assert str(val) in ("Yes", "No", "", "None", "nan"), (
+            f"pediatric_extension must be Yes/No/blank, got: {val!r}"
         )
 
 

@@ -37,3 +37,6 @@ HTTP_TIMEOUT = 20.0  # seconds per individual HTTP request
 
 # OCR for scanned product monograph PDFs (requires pdf2image + pytesseract + poppler)
 ENABLE_OCR = bool(int(os.getenv("ENABLE_OCR", "1")))
+
+# Concurrent PDF downloads + labeling enrichments in the async export job
+LABELING_SEMAPHORE = int(os.getenv("LABELING_SEMAPHORE", "8"))

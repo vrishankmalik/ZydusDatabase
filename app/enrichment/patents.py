@@ -29,7 +29,7 @@ import logging
 import re
 import zipfile
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 from bs4 import BeautifulSoup
@@ -221,12 +221,23 @@ async def _fetch_cpd_dates(patent_number: str) -> dict[str, Optional[str]]:
 
     async with _DETAIL_SEM:
         try:
-            async with httpx.AsyncClient(follow_redirects=True) as client:
+            async with httpx.AsyncClient(follow_redirects=False) as client:
                 r = await client.get(
                     url,
                     headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
                     timeout=HTTP_TIMEOUT,
                 )
+            # The CPD server currently issues a 308 redirect to a bare IP address
+            # (https://<IP>/) with no path — following it causes a 20-second timeout
+            # per patent.  Detect any 3xx immediately and skip; ZIP data is the
+            # authoritative fallback.
+            if r.is_redirect:
+                logger.warning(
+                    "CPD patent %s: server redirected to %r (broken server config) — "
+                    "skipping CPD; ZIP bulk data will be used as fallback",
+                    patent_number, r.headers.get("location", "?"),
+                )
+                return result
             if r.status_code == 404:
                 logger.warning("CPD page not found for patent %s (clean: %s) → %s",
                                patent_number, clean_pn, url)
@@ -343,7 +354,8 @@ async def fetch_patent_detail(
     Fallback: PR-RDB detail page (legacy, dates often absent there).
     Result is cached by patent_number.
     """
-    cache_key = f"cpd_detail:{patent_number}"
+    # v2: busts stale all-None entries cached when CPD was timing out
+    cache_key = f"cpd_detail_v2:{patent_number}"
     cached = cache_get("patent_detail", cache_key)
     if cached is not None:
         return cached
@@ -360,7 +372,10 @@ async def fetch_patent_detail(
         if any(result.get(k) for k in _DATE_FIELDS):
             logger.info("Patent %s: CPD had no dates; used PR-RDB fallback", patent_number)
 
-    cache_set("patent_detail", cache_key, result)
+    # Only cache when we have at least one real date — a transient failure (CPD
+    # redirect, network error) must not poison the cache with all-None results.
+    if any(result.get(k) for k in _DATE_FIELDS):
+        cache_set("patent_detail", cache_key, result)
     return result
 
 
@@ -372,7 +387,8 @@ async def load_patent_zip() -> dict[str, dict[str, Optional[str]]]:
     Returns dict[patent_number → {filing_date, grant_date, expiry_date}].
     Cached for 24 h.
     """
-    cached = cache_get("patent_zip", "bulk")
+    # v2: busts stale cache from prior run that stored only 1 entry
+    cached = cache_get("patent_zip", "bulk_v2")
     if cached is not None:
         return cached
 
@@ -440,7 +456,7 @@ def _parse_patent_zip(zip_bytes: bytes) -> dict[str, dict[str, Optional[str]]]:
         logger.warning("Patent.zip parse failed: %s", exc)
         return {}
 
-    cache_set("patent_zip", "bulk", result, ttl=60 * 60 * 24)
+    cache_set("patent_zip", "bulk_v2", result, ttl=60 * 60 * 24)
     return result
 
 
@@ -591,7 +607,10 @@ async def _din_to_patent_numbers(
 
 # ── Main enrichment entry point ───────────────────────────────────────────────
 
-async def enrich_patents(dins: list[str]) -> dict[str, list[dict]]:
+async def enrich_patents(
+    dins: list[str],
+    on_progress: Optional[Callable] = None,
+) -> dict[str, list[dict]]:
     """Enrich a list of DINs with patent dates from the CPD.
 
     Stores results in the patents and patent_discrepancies tables.
@@ -636,10 +655,19 @@ async def enrich_patents(dins: list[str]) -> dict[str, list[dict]]:
 
     # Enrich each (DIN, patent_number) pair using CPD dates
     pairs = [(din, pn) for din, pns in din_patent_map.items() for pn in pns]
-    await asyncio.gather(*[
-        _enrich_one(din, pn, session_id, zip_data)
-        for din, pn in pairs
-    ])
+    total_pairs = len(pairs)
+    done_count = 0
+
+    async def _enrich_tracked(din: str, pn: str) -> None:
+        nonlocal done_count
+        await _enrich_one(din, pn, session_id, zip_data)
+        done_count += 1
+        if on_progress is not None:
+            cb = on_progress(done_count, total_pairs, f"Patent {pn} (DIN {din})")
+            if asyncio.iscoroutine(cb):
+                await cb
+
+    await asyncio.gather(*[_enrich_tracked(din, pn) for din, pn in pairs])
 
     return {din: get_patents_for_din(din) for din in dins}
 

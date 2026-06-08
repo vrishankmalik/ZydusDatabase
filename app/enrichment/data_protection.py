@@ -243,15 +243,15 @@ async def fetch_data_protection_table() -> list[dict]:
 def _extract_dp_fields(row: dict) -> dict:
     """Extract the 3 output columns from a matched register row.
 
-    Normalises pediatric_extension to "Y" / "N" / "" (blank when unrecognised).
+    Normalises pediatric_extension to "Yes" or "No".
+    "N/A", blank, "-", or any unrecognised value → "No".
     """
     ped = row.get("pediatric_extension", "").strip().upper()
     if ped in ("YES", "Y", "1", "OUI"):
-        ped = "Y"
-    elif ped in ("NO", "N", "0", "NON"):
-        ped = "N"
+        ped = "Yes"
     else:
-        ped = ""
+        # N/A, blank, "-", "No", "N", unknown → No
+        ped = "No"
 
     return {
         "dp_6yr_no_file_date": row.get("no_file_date") or "",

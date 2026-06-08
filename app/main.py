@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, Response
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from pydantic import BaseModel
 
 from app.config import SOURCE_TIMEOUT
 from app.consistency import check_cross_source_consistency
@@ -16,6 +19,8 @@ from app.enrichment.labeling import enrich_labeling_batch
 from app.enrichment.patents import enrich_patents
 from app.enrichment.store import get_labeling_for_din
 from app.enrichment.workbook import _is_excluded_din, build_workbook
+from app.export_job import run_export_job
+from app.jobs import create_job, get_job
 from app.match import generate_summary
 from app.models import SearchMetadata, SearchResponse, SourceResult
 from app.normalize import normalize_query
@@ -27,11 +32,7 @@ from app.sources.patent_register import search_patent_register
 app = FastAPI(title="Canadian Drug Database Aggregator", version="1.0.0")
 
 
-async def _timed_source(
-    coro,
-    source_name: str,
-) -> SourceResult:
-    """Run a source coroutine with a global timeout."""
+async def _timed_source(coro, source_name: str) -> SourceResult:
     try:
         result = await asyncio.wait_for(coro, timeout=SOURCE_TIMEOUT)
         return result
@@ -62,34 +63,21 @@ async def search(
             sources=[],
         )
 
-    # Normalize / synonym-expand
     canonical, extra_terms = await normalize_query(q, field)
 
-    # Fan out to all four sources concurrently
-    dpd_task = _timed_source(
-        search_dpd(canonical, field, extra_terms), "DPD"
-    )
-    gen_task = _timed_source(
-        search_generic_submissions(canonical, field, extra_terms), "GenericSubmissions"
-    )
-    noc_task = _timed_source(
-        search_noc(canonical, field, extra_terms), "NOC"
-    )
-    pr_task = _timed_source(
-        search_patent_register(canonical, field, extra_terms), "PatentRegister"
-    )
+    dpd_task = _timed_source(search_dpd(canonical, field, extra_terms), "DPD")
+    gen_task = _timed_source(search_generic_submissions(canonical, field, extra_terms), "GenericSubmissions")
+    noc_task = _timed_source(search_noc(canonical, field, extra_terms), "NOC")
+    pr_task = _timed_source(search_patent_register(canonical, field, extra_terms), "PatentRegister")
 
     dpd_result, gen_result, noc_result, pr_result = await asyncio.gather(
         dpd_task, gen_task, noc_task, pr_task
     )
 
     sources = [dpd_result, gen_result, noc_result, pr_result]
-
-    # Cross-source consistency warnings (logged; never fail the request)
     all_records = [rec for s in sources for rec in s.records]
     check_cross_source_consistency(all_records)
 
-    # Optional AI summary
     ai_summary: Optional[str] = None
     if summary:
         ai_summary = await generate_summary(q, sources)
@@ -101,7 +89,6 @@ async def search(
         normalized_terms=[canonical] + extra_terms,
         per_source_status={s.source: s.status for s in sources},
     )
-
     return SearchResponse(metadata=metadata, sources=sources, ai_summary=ai_summary)
 
 
@@ -109,38 +96,17 @@ async def search(
 async def export(
     q: str = Query(...),
     field: str = Query("ingredient"),
-    allow_partial: bool = Query(
-        False,
-        description=(
-            "Build even if a source failed (adds '⚠ Source Status' warning sheet). "
-            "By default the endpoint refuses with HTTP 409 when any source is in error."
-        ),
-    ),
+    allow_partial: bool = Query(False),
 ) -> Response:
-    """Two-sheet enriched workbook download. Patent and labeling enrichment run automatically.
-
-    Sheet 1 — 'DPD + NOC + Patents': one row per DIN, NOC N/A rows excluded,
-    patent dates and labeling fields populated from the enrichment store.
-    Sheet 2 — 'Generic Submissions': GSUR filtered to the queried ingredient.
-
-    If any source returns status='error' and allow_partial=False (default), the
-    endpoint returns HTTP 409 naming the failed source(s).
-    A no_results source is truthful and does not block the build.
-    """
+    """Synchronous two-sheet enriched workbook download (blocks until complete)."""
     result = await search(q=q, field=field, summary=False)
 
-    # Guard: refuse to silently build a partial workbook when a source failed.
-    # "error" = fetch failed; "no_results" = genuine empty (allowed to proceed).
     error_sources: dict[str, Optional[str]] = {
-        s.source: s.error_message
-        for s in result.sources
-        if s.status == "error"
+        s.source: s.error_message for s in result.sources if s.status == "error"
     }
     if error_sources and not allow_partial:
         names = ", ".join(error_sources.keys())
-        details = "; ".join(
-            f"{k}: {v or 'unknown error'}" for k, v in error_sources.items()
-        )
+        details = "; ".join(f"{k}: {v or 'unknown error'}" for k, v in error_sources.items())
         raise HTTPException(
             status_code=409,
             detail=(
@@ -149,20 +115,12 @@ async def export(
             ),
         )
 
-    # Collect valid DINs for enrichment
     all_valid_dins = [
-        r.din
-        for s in result.sources
-        for r in s.records
-        if not _is_excluded_din(r.din)
+        r.din for s in result.sources for r in s.records if not _is_excluded_din(r.din)
     ]
-
-    # Patent enrichment — always runs; the module skips DINs already stored
     if all_valid_dins:
         await enrich_patents(all_valid_dins)
 
-    # Labeling enrichment — only for DPD records (need drug_code + strength);
-    # skip DINs already in the store so repeat exports are fast.
     din_map: dict[str, tuple[int, Optional[str]]] = {}
     for s in result.sources:
         if s.source != "DPD":
@@ -196,12 +154,102 @@ async def export(
     )
 
 
+# ── Async export: start / stream / result ─────────────────────────────────────
+
+class ExportStartRequest(BaseModel):
+    q: str
+    field: str = "ingredient"
+    allow_partial: bool = False
+    enable_ocr: bool = True
+    enable_llm: bool = True
+
+
+@app.post("/export/start")
+async def export_start(req: ExportStartRequest) -> dict:
+    """Create a background export job and return its job_id immediately."""
+    job_id = uuid.uuid4().hex
+    job = create_job(job_id, req.q.strip(), req.field)
+    asyncio.create_task(
+        run_export_job(job, req.allow_partial, req.enable_ocr, req.enable_llm)
+    )
+    return {"job_id": job_id}
+
+
+@app.get("/export/stream/{job_id}")
+async def export_stream(job_id: str) -> StreamingResponse:
+    """Server-Sent Events stream for export job progress.
+
+    Each event is a JSON object:
+      progress: {stage, done, total, pct, elapsed_s, eta_s, log}
+      complete: {status:"complete", download_url, elapsed_s, log}
+      error:    {status:"error", message, elapsed_s}
+
+    A `: keepalive` comment is sent every 15 s to prevent proxy timeouts.
+    Reconnecting clients receive all buffered events from the start.
+    """
+    job = get_job(job_id)
+
+    async def _gen():
+        if job is None:
+            yield f"data: {json.dumps({'status': 'error', 'message': 'Job not found'})}\n\n"
+            return
+
+        idx = 0
+        while True:
+            # Drain all buffered events
+            while idx < len(job.events):
+                evt = job.events[idx]
+                idx += 1
+                yield f"data: {json.dumps(evt)}\n\n"
+                if evt.get("status") in ("complete", "error"):
+                    return
+
+            if job.status in ("complete", "error"):
+                return
+
+            # Race fix: clear notify flag, then re-check list length before waiting
+            job._notify.clear()
+            if idx < len(job.events):
+                continue
+
+            try:
+                await asyncio.wait_for(job._notify.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.get("/export/result/{job_id}")
+async def export_result(job_id: str) -> FileResponse:
+    """Download the finished XLSX. Returns 409 if the job is still running."""
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job.status != "complete" or not job.result_path:
+        raise HTTPException(409, f"Job not complete (status={job.status})")
+    filename = f"canadian_drugs_{job.query.replace(' ', '_')}_{job.field}.xlsx"
+    return FileResponse(
+        path=job.result_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+    )
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
     return HTMLResponse(content=_HTML_UI)
 
 
-# --- Embedded single-page UI -----------------------------------------------
+# ── Embedded single-page UI ────────────────────────────────────────────────────
 _HTML_UI = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -241,8 +289,8 @@ _HTML_UI = """<!DOCTYPE html>
   .btn { padding: 9px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.95rem; font-weight: 600; }
   .btn-primary { background: var(--maple); color: white; }
   .btn-primary:hover { background: #b52222; }
-  .btn-export { background: #1a7340; color: white; margin-left: 8px; }
-  .btn-export:hover { background: #155a33; }
+  .btn-export { background: #1a7340; color: white; }
+  .btn-export:hover:not(:disabled) { background: #155a33; }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
   .summary-bar { background: #fff3cd; border: 1px solid #ffc107; border-radius: 6px; padding: 10px 16px; font-size: 0.9rem; margin-bottom: 16px; display: none; }
   .ai-summary { background: #e8f4fd; border: 1px solid #90caf9; border-radius: 6px; padding: 12px 16px; font-size: 0.9rem; margin-bottom: 16px; display: none; }
@@ -290,6 +338,52 @@ _HTML_UI = """<!DOCTYPE html>
   .company-chip { background: #e9ecef; border-radius: 12px; padding: 2px 8px; font-size: 0.74rem; color: var(--muted); }
   .company-chip.more { background: transparent; border: 1px solid var(--border); }
   .combo-body table { border-radius: 0; border: none; border-top: 1px solid var(--border); }
+  /* Export progress panel */
+  .export-panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 20px;
+    display: none;
+  }
+  .export-panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  .export-stage-label { font-weight: 700; font-size: 0.95rem; }
+  .export-stats { font-size: 0.82rem; color: var(--muted); }
+  .progress-track {
+    height: 10px;
+    background: #e9ecef;
+    border-radius: 5px;
+    overflow: hidden;
+    margin-bottom: 10px;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--ok);
+    border-radius: 5px;
+    transition: width 0.4s ease;
+    width: 0%;
+  }
+  .progress-fill.error { background: var(--err); }
+  .export-log {
+    height: 130px;
+    overflow-y: auto;
+    font-size: 0.74rem;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    background: #1a1a2e;
+    color: #c8d0e8;
+    padding: 8px 10px;
+    border-radius: 4px;
+    line-height: 1.5;
+  }
+  .export-log .log-ok { color: #7ec880; }
+  .export-log .log-err { color: #f28b82; }
+  .export-log .log-dim { color: #888; }
 </style>
 </head>
 <body>
@@ -318,12 +412,35 @@ _HTML_UI = """<!DOCTYPE html>
           <input type="checkbox" id="summary"/> AI Summary (requires Ollama)
         </label>
       </div>
-      <div class="field-group" style="justify-content:flex-end">
-        <button class="btn btn-primary" id="searchBtn" onclick="doSearch()">Search</button>
-        <button class="btn btn-export" id="exportBtn" onclick="doExport()" disabled>⬇ Download XLSX</button>
+      <div class="field-group" style="justify-content:flex-end; gap:6px">
+        <div style="display:flex; gap:10px; align-items:center; margin-bottom:4px;">
+          <label class="checkbox-label" title="Run OCR on scanned product monograph PDFs">
+            <input type="checkbox" id="enableOcr" checked/> OCR
+          </label>
+          <label class="checkbox-label" title="Use Ollama LLM for PDF field extraction">
+            <input type="checkbox" id="enableLlm" checked/> LLM
+          </label>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-primary" id="searchBtn" onclick="doSearch()">Search</button>
+          <button class="btn btn-export" id="exportBtn" onclick="doExport()" disabled>⬇ Export XLSX</button>
+        </div>
       </div>
     </div>
   </div>
+
+  <!-- Export progress panel (shown while job runs) -->
+  <div class="export-panel" id="exportPanel">
+    <div class="export-panel-header">
+      <span class="export-stage-label" id="exportStageLabel">Starting…</span>
+      <span class="export-stats" id="exportStats"></span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+    <div class="export-log" id="exportLog"></div>
+  </div>
+
   <div class="summary-bar" id="summaryBar"></div>
   <div class="ai-summary" id="aiSummary"></div>
   <div id="results"></div>
@@ -386,15 +503,15 @@ const SOURCE_COLS = {
 };
 
 let lastResponse = null;
+let currentJobId = null;
+let currentEventSource = null;
 
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 function fieldVal(record, key) {
-  if (key.startsWith('_')) {
-    return (record.source_specific || {})[key.slice(1)] || '';
-  }
+  if (key.startsWith('_')) return (record.source_specific || {})[key.slice(1)] || '';
   return record[key] || '';
 }
 
@@ -511,7 +628,6 @@ function render(data) {
   const { metadata, sources, ai_summary } = data;
   const searchedIngredient = metadata.field === 'ingredient' ? metadata.query : null;
 
-  // Summary bar
   const bar = document.getElementById('summaryBar');
   const counts = sources.map(s => `${SOURCE_LABELS[s.source]||s.source}: <strong>${s.count}</strong>`).join(' &nbsp;|&nbsp; ');
   bar.innerHTML = `Searched for <strong>"${escHtml(metadata.query)}"</strong> by <em>${escHtml(metadata.field)}</em> &nbsp;·&nbsp; ${counts}`;
@@ -520,7 +636,6 @@ function render(data) {
   }
   bar.style.display = 'block';
 
-  // AI Summary
   const aiDiv = document.getElementById('aiSummary');
   if (ai_summary) {
     aiDiv.innerHTML = `<strong>🤖 AI Summary</strong> <em style="font-size:.75rem;color:#666">(AI-generated, may be imprecise — verify against raw data)</em><br/>${ai_summary}`;
@@ -529,7 +644,6 @@ function render(data) {
     aiDiv.style.display = 'none';
   }
 
-  // Build tabs
   const tabSources = ['Combined', ...sources.map(s => s.source)];
   const tabLabels = { Combined: 'Combined', ...Object.fromEntries(sources.map(s=>[s.source, SOURCE_LABELS[s.source]||s.source])) };
 
@@ -570,6 +684,9 @@ async function doSearch() {
   document.getElementById('aiSummary').style.display = 'none';
   document.getElementById('results').innerHTML = '<div class="loading-msg"><div class="spinner"></div>Querying all four databases concurrently…</div>';
 
+  // Close any in-progress export
+  _closeExport();
+
   try {
     const url = `/api/search?q=${encodeURIComponent(q)}&field=${field}&summary=${summary}`;
     const resp = await fetch(url);
@@ -583,11 +700,128 @@ async function doSearch() {
   }
 }
 
-function doExport() {
+// ---- Async export with SSE progress ----
+
+function _closeExport() {
+  if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
+  currentJobId = null;
+}
+
+function _appendLog(line, cls) {
+  const log = document.getElementById('exportLog');
+  const div = document.createElement('div');
+  div.className = cls || '';
+  div.textContent = line;
+  log.appendChild(div);
+  // Keep last 50 lines
+  while (log.children.length > 50) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
+}
+
+function _handleExportEvent(data) {
+  const fill = document.getElementById('progressFill');
+  const stageLabel = document.getElementById('exportStageLabel');
+  const stats = document.getElementById('exportStats');
+
+  if (data.status === 'complete') {
+    fill.style.width = '100%';
+    fill.classList.remove('error');
+    stageLabel.textContent = `✓ Done in ${data.elapsed_s}s`;
+    stats.textContent = '';
+    _appendLog(`✓ ${data.log}`, 'log-ok');
+    // Auto-trigger download
+    const a = document.createElement('a');
+    a.href = data.download_url;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    document.getElementById('exportBtn').disabled = false;
+    _closeExport();
+    return;
+  }
+
+  if (data.status === 'error') {
+    fill.classList.add('error');
+    stageLabel.textContent = `✗ Error`;
+    stats.textContent = data.elapsed_s ? `${data.elapsed_s}s elapsed` : '';
+    _appendLog(`✗ ERROR: ${data.message}`, 'log-err');
+    document.getElementById('exportBtn').disabled = false;
+    _closeExport();
+    return;
+  }
+
+  // Progress event
+  const pct = Math.round((data.pct || 0) * 100);
+  fill.style.width = `${pct}%`;
+  stageLabel.textContent = `${data.stage}: ${data.done}/${data.total}`;
+  const etaStr = data.eta_s != null ? ` · ETA ${data.eta_s}s` : '';
+  stats.textContent = `${pct}% · ${data.elapsed_s}s elapsed${etaStr}`;
+  if (data.log) _appendLog(`[${data.stage}] ${data.log}`);
+}
+
+async function doExport() {
   const q = document.getElementById('query').value.trim();
   const field = document.getElementById('field').value;
   if (!q) return;
-  window.location = `/api/export?q=${encodeURIComponent(q)}&field=${field}`;
+
+  const enableOcr = document.getElementById('enableOcr').checked;
+  const enableLlm = document.getElementById('enableLlm').checked;
+
+  // Disable export button, show panel
+  document.getElementById('exportBtn').disabled = true;
+  const panel = document.getElementById('exportPanel');
+  panel.style.display = 'block';
+  document.getElementById('exportLog').innerHTML = '';
+  document.getElementById('progressFill').style.width = '0%';
+  document.getElementById('progressFill').classList.remove('error');
+  document.getElementById('exportStageLabel').textContent = 'Starting export…';
+  document.getElementById('exportStats').textContent = '';
+
+  _closeExport();
+
+  // Start the job
+  let jobId;
+  try {
+    const resp = await fetch('/export/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q, field, allow_partial: false, enable_ocr: enableOcr, enable_llm: enableLlm }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    jobId = data.job_id;
+    currentJobId = jobId;
+  } catch (e) {
+    document.getElementById('exportStageLabel').textContent = `✗ Error: ${e.message}`;
+    document.getElementById('progressFill').classList.add('error');
+    document.getElementById('exportBtn').disabled = false;
+    return;
+  }
+
+  // Open SSE stream
+  const es = new EventSource(`/export/stream/${jobId}`);
+  currentEventSource = es;
+
+  es.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      _handleExportEvent(data);
+    } catch (e) {
+      _appendLog(`[parse error] ${event.data}`, 'log-err');
+    }
+  };
+
+  es.onerror = () => {
+    if (currentJobId !== jobId) return; // stale
+    _appendLog('Connection lost — check server', 'log-err');
+    document.getElementById('exportStageLabel').textContent = 'Connection error';
+    document.getElementById('exportBtn').disabled = false;
+    es.close();
+  };
 }
 
 document.getElementById('query').addEventListener('keydown', e => {

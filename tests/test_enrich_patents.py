@@ -291,3 +291,95 @@ def test_parse_patent_zip_by_din_uses_drug_id_join():
     result = _parse_patent_zip_by_din(zip_bytes)
     assert "02562383" in result
     assert "2630344" in result["02562383"]
+
+
+# ── regression: CPD redirect bug — dates must come from ZIP when CPD broken ───
+
+def test_fetch_cpd_dates_detects_redirect_and_returns_none():
+    """When CPD returns a 3xx redirect (broken server config), _fetch_cpd_dates
+    must return None for all date fields immediately — no 20-second timeout."""
+    import asyncio
+    from unittest.mock import MagicMock, patch
+
+    # Simulate the real broken CPD redirect: 308 → bare IP
+    mock_response = MagicMock()
+    mock_response.is_redirect = True
+    mock_response.headers = {"location": "https://50.195.125.245/"}
+    mock_response.status_code = 308
+
+    async def _mock_get(*args, **kwargs):
+        return mock_response
+
+    async def run():
+        from app.enrichment.patents import _fetch_cpd_dates
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = _mock_get
+            mock_client_cls.return_value = mock_client
+            return await _fetch_cpd_dates("2630344")
+
+    from unittest.mock import AsyncMock
+    result = asyncio.run(run())
+    assert result["filing_date"] is None
+    assert result["grant_date"] is None
+    assert result["expiry_date"] is None
+
+
+def test_cpd_fixture_parses_correctly():
+    """Offline fixture test: _fetch_cpd_dates parse logic produces correct dates
+    when the CPD page is reachable (regression guard against parse-logic breakage)."""
+    import asyncio
+    from unittest.mock import MagicMock, AsyncMock, patch
+
+    html = (FIXTURES / "cpd" / "summary_2630344.html").read_text()
+
+    mock_response = MagicMock()
+    mock_response.is_redirect = False
+    mock_response.status_code = 200
+    mock_response.text = html
+
+    async def _mock_get(*args, **kwargs):
+        return mock_response
+
+    async def run():
+        from app.enrichment.patents import _fetch_cpd_dates
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = _mock_get
+            mock_client_cls.return_value = mock_client
+            return await _fetch_cpd_dates("2630344")
+
+    result = asyncio.run(run())
+    assert result["filing_date"] == "2007-03-23", f"filing_date wrong: {result['filing_date']}"
+    assert result["grant_date"] == "2015-04-28", f"grant_date wrong: {result['grant_date']}"
+    assert result["expiry_date"] == "2027-03-23", f"expiry_date wrong: {result['expiry_date']}"
+
+
+@pytest.mark.asyncio
+async def test_zip_fallback_when_cpd_redirects(tmp_path):
+    """End-to-end: CPD broken (308 redirect) → ZIP data provides all 3 dates."""
+    _reset_store(tmp_path)
+    import app.enrichment.store as store_mod
+
+    from app.enrichment.patents import _enrich_one
+
+    # CPD returns all-None because of the redirect
+    cpd_none = {"filing_date": None, "grant_date": None, "expiry_date": None,
+                "detail_url": "https://brevets-patents.ic.gc.ca/opic-cipo/cpd/eng/patent/2630344/summary.html"}
+
+    zip_data = {
+        "2630344": {"filing_date": "2007-03-23", "grant_date": "2015-04-28", "expiry_date": "2027-03-23"}
+    }
+
+    with patch("app.enrichment.patents.fetch_patent_detail", new=AsyncMock(return_value=cpd_none)):
+        await _enrich_one("02562383", "2630344", "", zip_data)
+
+    patents = store_mod.get_patents_for_din("02562383")
+    assert len(patents) == 1
+    assert patents[0]["filing_date"] == "2007-03-23", "Filing date must come from ZIP when CPD returns None"
+    assert patents[0]["grant_date"] == "2015-04-28", "Grant date must come from ZIP when CPD returns None"
+    assert patents[0]["expiry_date"] == "2027-03-23", "Expiry date must come from ZIP when CPD returns None"

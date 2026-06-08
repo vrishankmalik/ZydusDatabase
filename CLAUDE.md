@@ -37,6 +37,7 @@ tests/
     fuzzy_pairs.csv                 # Hand-labeled (query, option, expected_match) benchmark
     labeling/piqray_pages.json      # PIQRAY monograph fixture for golden labeling tests
     patent_register/detail_2709025.html  # Patent detail page fixture
+    cpd/summary_2630344.html        # CPD summary fixture (lecanemab/LEQEMBI) for offline parse test
 ```
 
 ## Running
@@ -151,12 +152,15 @@ All three commands share the SQLite enrichment store at `$CACHE_DIR/enrichment.d
 `python -m app.enrichment.patents --dins DIN1 DIN2 ...`  
 Or via API: `GET /api/export-enriched?q=alpelisib&field=ingredient` (runs enrich-patents automatically).
 
-- Looks up each DIN's patent numbers from the Patent Register live search.
-- For each patent, fetches the detail page for filing/grant/expiry dates.
-- Downloads `Patent.zip` bulk extract and cross-checks every date field.
-- **On discrepancy: uses the website value** and logs (DIN, patent_number, field, website_value, zip_value) to the `patent_discrepancies` table.
+- Looks up each DIN's patent numbers. Primary: Patent.zip DIN map (avoids HTML concat bugs). Fallback: PR-RDB live search.
+- For each patent, attempts the CPD summary page for filing/grant/expiry dates.
+  - **CPD server issue:** as of June 2026, `brevets-patents.ic.gc.ca` returns a 308 redirect to a bare IP (`https://<IP>/`) with no path. The code detects this redirect immediately (`follow_redirects=False`) and skips CPD without blocking. ZIP bulk data is the authoritative date source until CPD is fixed.
+- Downloads `Patent.zip` bulk extract (`patent-service_e.txt`) and uses its dates as the primary source (or fallback when CPD is unavailable).
+- **On CPD/ZIP discrepancy: uses the CPD (website) value** and logs (DIN, patent_number, field, website_value, zip_value) to the `patent_discrepancies` table.
 - Stores rows in `patents(din, patent_number, filing_date, grant_date, expiry_date)`.
 - A DIN with no patents, or a patent with no dates, is recorded cleanly.
+- **Canary verified (LEQEMBI / lecanemab DIN 02562383):** patent 2630344 → filing 2007-03-23, grant 2015-04-28, expiry 2027-03-23. Dates come from Patent.zip when CPD is redirecting.
+- **Offline fixture test:** `tests/fixtures/cpd/summary_2630344.html` verifies the CPD parse logic is correct if/when CPD becomes reachable again. `tests/test_enrich_patents.py::test_cpd_fixture_parses_correctly` locks this parse.
 
 ### `enrich-labeling` (accuracy-critical)
 
@@ -269,11 +273,13 @@ The ZIP uses a **two-file join** — not a single flat CSV:
 - `drugs_e.txt`: `DRUG_ID → DIN` mapping (columns: `DRUG_ID`, `DIN`, `MEDICINAL_INGREDIENT_E`, `BRAND_NAME_E`, …)
 - `patent-service_e.txt`: `DRUG_ID → PATENT_NUMBER + dates` (columns: `DRUG_ID`, `PATENT_NUMBER`, `FILING_DATE`, `DATE_GRANTED`, `EXPIRATION_DATE`, …)
 
-DIN-to-patent mapping requires joining on `DRUG_ID`. Dates are MM/DD/YYYY (converted to ISO internally). The CPD website (`brevets-patents.ic.gc.ca`) provides cross-check dates but may be unreachable; ZIP dates are the authoritative fallback.
+DIN-to-patent mapping requires joining on `DRUG_ID`. Dates are MM/DD/YYYY (converted to ISO internally). The CPD website (`brevets-patents.ic.gc.ca`) is currently broken (308 redirect to bare IP) — ZIP dates are the authoritative source. CPD is attempted first with `follow_redirects=False`; any 3xx response is skipped immediately. All-None `patent_detail` results are not cached so failures don't poison the cache.
 
 ## Register of Innovative Drugs (data protection)
 
 The `id="a1"` attribute is on the `<table>` element itself (not a preceding anchor) — `_find_active_table` returns the table directly. The column "Drug(s) Containing the Medicinal Ingredient / Variations" (col 4) also contains "medicinal ingredient" as a substring; the parser guards against it by requiring the header to **start with** "Medicinal Ingredient".
+
+**`pediatric_extension` column:** output is `"Yes"` or `"No"` only — no blank, no "Y"/"N". "N/A", blank, "-", or any unrecognised value in the Register cell → `"No"`. Tested in `test_data_protection.py::test_extract_dp_fields_na_becomes_no`.
 
 ## pack_style extraction rules
 
