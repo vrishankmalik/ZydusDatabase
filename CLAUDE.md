@@ -2,6 +2,11 @@
 
 A local web application that searches four Canadian health-product databases simultaneously and returns consolidated results viewable in a web UI or downloadable as XLSX.
 
+## Development Rules
+
+**Scope discipline — change only what is described.**
+When implementing a task, modify only the files and lines that the task explicitly requires. Do not rename variables, reformat unrelated code, add comments to unchanged functions, or alter logic outside the described scope — even if the surrounding code looks improvable. Side-effect changes are the leading cause of regressions in this codebase.
+
 ## Architecture Overview
 
 ```
