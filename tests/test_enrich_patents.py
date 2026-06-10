@@ -73,8 +73,11 @@ def _make_patent_zip(drug_rows: list, patent_rows: list) -> bytes:
     return buf.getvalue()
 
 
-def test_parse_patent_zip_reads_correct_files():
+def test_parse_patent_zip_reads_correct_files(monkeypatch):
     """_parse_patent_zip uses patent-service_e.txt with MM/DD/YYYY dates."""
+    import app.enrichment.patents as patents_mod
+    monkeypatch.setattr(patents_mod, "cache_set", lambda *a, **kw: None)
+
     from app.enrichment.patents import _parse_patent_zip
 
     zip_bytes = _make_patent_zip(
@@ -89,8 +92,11 @@ def test_parse_patent_zip_reads_correct_files():
     assert result["2709025"]["expiry_date"] == "2028-12-10"
 
 
-def test_parse_patent_zip_by_din_joins_correctly():
+def test_parse_patent_zip_by_din_joins_correctly(monkeypatch):
     """_parse_patent_zip_by_din joins drugs_e.txt → patent-service_e.txt by DRUG_ID."""
+    import app.enrichment.patents as patents_mod
+    monkeypatch.setattr(patents_mod, "cache_set", lambda *a, **kw: None)
+
     from app.enrichment.patents import _parse_patent_zip_by_din
 
     zip_bytes = _make_patent_zip(
@@ -108,7 +114,10 @@ def test_parse_patent_zip_by_din_joins_correctly():
     assert "9999999" in result["09999999"]
 
 
-def test_parse_patent_zip_empty_returns_empty():
+def test_parse_patent_zip_empty_returns_empty(monkeypatch):
+    import app.enrichment.patents as patents_mod
+    monkeypatch.setattr(patents_mod, "cache_set", lambda *a, **kw: None)
+
     from app.enrichment.patents import _parse_patent_zip
     import io, zipfile
 
@@ -264,8 +273,11 @@ def test_parse_zip_date_handles_us_format():
     assert _parse_zip_date(None) is None
 
 
-def test_parse_patent_zip_dates_from_patent_service_file():
+def test_parse_patent_zip_dates_from_patent_service_file(monkeypatch):
     """_parse_patent_zip reads PATENT_NUMBER+dates from patent-service_e.txt."""
+    import app.enrichment.patents as patents_mod
+    monkeypatch.setattr(patents_mod, "cache_set", lambda *a, **kw: None)
+
     from app.enrichment.patents import _parse_patent_zip
 
     zip_bytes = _make_patent_zip(
@@ -279,8 +291,11 @@ def test_parse_patent_zip_dates_from_patent_service_file():
     assert result["2630344"]["expiry_date"] == "2027-03-23"
 
 
-def test_parse_patent_zip_by_din_uses_drug_id_join():
+def test_parse_patent_zip_by_din_uses_drug_id_join(monkeypatch):
     """DIN→patent mapping requires the DRUG_ID join; DIN alone in wrong file is insufficient."""
+    import app.enrichment.patents as patents_mod
+    monkeypatch.setattr(patents_mod, "cache_set", lambda *a, **kw: None)
+
     from app.enrichment.patents import _parse_patent_zip_by_din
 
     # Lecanemab: DRUG_ID=5556, DIN=02562383, patent=2630344

@@ -696,10 +696,17 @@ async def enrich_patents(
     if not dins:
         return {}
 
-    # Skip DINs already enriched (have at least one patent row in the store).
-    # This makes enrich_patents idempotent: a second call for the same DIN is a
-    # no-op so concurrent export paths don't overwrite each other's data.
-    unenriched = [d for d in dins if not get_patents_for_din(d)]
+    # Skip DINs that already have at least one patent row with a non-null date.
+    # A row with all-null dates means the prior enrichment got nothing (e.g. cache
+    # poisoned by a test or CPD/ZIP both unavailable) — treat it as unenriched so
+    # it gets retried on the next export.
+    def _has_dates(din: str) -> bool:
+        return any(
+            r.get("filing_date") or r.get("grant_date") or r.get("expiry_date")
+            for r in get_patents_for_din(din)
+        )
+
+    unenriched = [d for d in dins if not _has_dates(d)]
     already_enriched = [d for d in dins if d not in set(unenriched)]
     if already_enriched:
         logger.debug(
