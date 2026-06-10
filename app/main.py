@@ -1029,17 +1029,7 @@ _HTML_UI = """<!DOCTYPE html>
           <option value="din">DIN</option>
         </select>
       </div>
-      <div class="field-group" style="justify-content:flex-end">
-        <label class="checkbox-label">
-          <input type="checkbox" id="summary"/> AI Summary (requires LLM provider)
-        </label>
-      </div>
-      <div class="field-group" style="justify-content:flex-end; gap:6px">
-        <div style="display:flex; gap:10px; align-items:center; margin-bottom:4px;">
-          <label class="checkbox-label" title="Run OCR on scanned product monograph PDFs">
-            <input type="checkbox" id="enableOcr" checked/> OCR
-          </label>
-        </div>
+      <div class="field-group" style="justify-content:flex-end; gap:6px; margin-top:12px;">
         <div style="display:flex; gap:8px;">
           <button class="btn btn-primary" id="searchBtn" onclick="doSearch()">Search</button>
           <button class="btn btn-export" id="exportBtn" onclick="doExport()" disabled>⬇ Export XLSX</button>
@@ -1350,7 +1340,6 @@ async function doSearch() {
   // Search previews the FIRST ingredient; multi-product export runs all.
   const q = queries[0];
   const field = document.getElementById('field').value;
-  const summary = document.getElementById('summary').checked;
   if (queries.length > 1) {
     // Show a brief notice that only the first is being previewed
     document.getElementById('queryHint').innerHTML =
@@ -1366,7 +1355,7 @@ async function doSearch() {
   _closeExport();
 
   try {
-    const url = `/api/search?q=${encodeURIComponent(q)}&field=${field}&summary=${summary}`;
+    const url = `/api/search?q=${encodeURIComponent(q)}&field=${field}&summary=false`;
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
@@ -1452,8 +1441,6 @@ async function doExport() {
   if (!queries.length) return;
   const field = document.getElementById('field').value;
 
-  const enableOcr = document.getElementById('enableOcr').checked;
-
   // Disable export button, show panel
   document.getElementById('exportBtn').disabled = true;
   const panel = document.getElementById('exportPanel');
@@ -1475,7 +1462,7 @@ async function doExport() {
     const resp = await fetch('/export/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ queries, field, allow_partial: false, enable_ocr: enableOcr }),
+      body: JSON.stringify({ queries, field, allow_partial: false, enable_ocr: true }),
     });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
