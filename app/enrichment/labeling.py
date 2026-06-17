@@ -162,15 +162,35 @@ _CONTAINER_PATTERNS: list[tuple[re.Pattern, str]] = [
 
 
 def _extract_pack_style_from_text(text: str, source_label: str = "") -> Optional[str]:
-    """Return Title-Case container label if any vocabulary keyword is found in text."""
+    """Return "; "-joined Title-Case container labels for all vocabulary keywords found.
+
+    Traverses the vocab in longest-match-first order to collect all distinct
+    container types.  Shorter labels that are already covered by a compound
+    label found earlier are suppressed (e.g. "Blister" is dropped when
+    "Blister Pack" was already matched in the same text).
+    """
+    found: list[str] = []
+    seen: set[str] = set()
     for pattern, label in _CONTAINER_PATTERNS:
+        if label in seen:
+            continue
         if pattern.search(text):
-            if source_label:
-                logger.info(
-                    "pack_style=%r found in %s (text snippet: %r)",
-                    label, source_label, text[:100],
-                )
-            return label
+            found.append(label)
+            seen.add(label)
+    # Remove labels whose full text appears as a trailing word in a longer compound
+    # label already matched (e.g. "Blister" when "Blister Pack" was also found).
+    final = [
+        lbl for lbl in found
+        if not any(other != lbl and other.upper().endswith(lbl.upper()) for other in seen)
+    ]
+    if final:
+        result = "; ".join(final)
+        if source_label:
+            logger.info(
+                "pack_style=%r found in %s (text snippet: %r)",
+                result, source_label, text[:100],
+            )
+        return result
     return None
 
 
@@ -190,6 +210,17 @@ def _extract_pack_size_from_product_info(prod_info: str) -> Optional[str]:
       "8 COUNT BLISTERS"                                          → "8 count"
     """
     text_upper = prod_info.upper()
+
+    # Slash-separated container sizes with mass/volume units: "20g/50g/500g", "10mL/20mL"
+    # These appear in DPD product_information for weight/volume-based containers.
+    # Must be handled before the single-volume check so multi-size cases win.
+    if '/' in text_upper:
+        size_parts = re.findall(r'\b(\d+(?:\.\d+)?)\s*(G|ML|L)\b', text_upper)
+        if len(size_parts) >= 2:
+            units = {u for _, u in size_parts}
+            if len(units) == 1:
+                display_unit = {'G': 'g', 'ML': 'mL', 'L': 'L'}[size_parts[0][1]]
+                return ", ".join(f"{n} {display_unit}" for n, _ in size_parts)
 
     # Volume: standalone N mL / N L — NOT a concentration like 80MG/ML
     vol_m = re.search(
@@ -944,6 +975,16 @@ _PACK_CLINICAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Sentences describing storage/stability conditions look like packaging sentences
+# (they mention container types and numbers) but are not.  Reject them explicitly.
+_PACK_STORAGE_RE = re.compile(
+    r"\b(?:after\s+opening|discard(?:ed)?\b|days?\s+after|hours?\s+after|"
+    r"store(?:d)?\s+at\b|refrigerat|protect\s+from\s+(?:light|heat|moisture)|"
+    r"keep\s+out\s+of\s+reach|expir(?:y|ation)|shelf\s*life|"
+    r"should\s+be\s+(?:discarded|stored)|to\s+ensure\s+sterility)\b",
+    re.IGNORECASE,
+)
+
 
 def _scan_for_pack_sentence(text: str) -> Optional[tuple[Optional[str], str]]:
     """Content-first packaging scanner: no section format assumed.
@@ -957,7 +998,11 @@ def _scan_for_pack_sentence(text: str) -> Optional[tuple[Optional[str], str]]:
       - "in 60 mL and 120 mL plastic bottles"
       - "in aluminium PVC/PCTFE blisters; 56-tablet carton"
     """
-    for sent in re.split(r"(?<=[.!?])\s+|\n", text):
+    # Split on sentence-ending punctuation only — not bare newlines.
+    # Splitting on \n breaks multi-line packaging sentences like:
+    #   "available in the following\ncontainers: 500g jars; 20g and 50g tubes."
+    # into two fragments, causing both to fail individual checks.
+    for sent in re.split(r"(?<=[.!?])\s+", text):
         sent = sent.strip()
         if len(sent) < 10:
             continue
@@ -965,9 +1010,22 @@ def _scan_for_pack_sentence(text: str) -> Optional[tuple[Optional[str], str]]:
             continue
         if _PACK_CLINICAL_RE.search(sent):
             continue
+        # Reject storage/stability sentences: they mention containers + numbers
+        # but are describing shelf-life conditions, not pack sizes.
+        if _PACK_STORAGE_RE.search(sent):
+            continue
         # Must have a number that survives stripping out strength values
         without_strengths = _PACK_STRENGTH_NUM_RE.sub("", sent)
-        if not re.search(r"\b\d+\b", without_strengths):
+        has_count = bool(re.search(r"\b\d+\b", without_strengths))
+        # Second chance: explicit container-enumeration language ("containers:",
+        # "available in", "supplied in") — handles weight-based container sizes
+        # like "500g jars; 20g and 50g tubes" where all numbers are stripped
+        # as gram-strength units yet the sentence is clearly about packaging.
+        has_container_context = bool(re.search(
+            r"\bcontainers?\b|\bavailable\s+in\b|\bsupplied\s+in\b|\bpackaged\s+in\b",
+            sent, re.IGNORECASE,
+        ))
+        if not has_count and not has_container_context:
             continue
         label = _extract_pack_style_from_text(sent)
         if not label:
@@ -2010,7 +2068,7 @@ def _run_pack_style_validation() -> None:
             "din": "02XXX000",
             "label": "Icosapent 1g capsule — blister + bottle",
             "product_information": "8 COUNT BLISTERS AND BOTTLES OF 120 CAPSULES",
-            "expected_pack_style": "Blister",
+            "expected_pack_style": "Blister; Bottle",
             "expected_pack_size": "8-count blister; 120-count bottle",
         },
         {
