@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -75,6 +75,21 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# Raise the upload body limit to 100 MB (default is 1 MB, too small for IQVIA Excel files).
+_MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
+
+@app.middleware("http")
+async def _limit_upload_size(request: Request, call_next):
+    if request.method == "POST" and request.url.path == "/api/iqvia/upload":
+        cl = request.headers.get("content-length")
+        if cl and int(cl) > _MAX_UPLOAD_BYTES:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=413,
+                content={"detail": f"File too large — maximum upload size is 100 MB."},
+            )
+    return await call_next(request)
 
 import pathlib as _pathlib
 _static_dir = _pathlib.Path(__file__).parent / "static"
@@ -417,7 +432,7 @@ async def reset_all_caches() -> dict:
 # ── IQVIA upload ──────────────────────────────────────────────────────────────
 
 @app.post("/api/iqvia/upload")
-async def iqvia_upload(file: UploadFile = File(...)) -> dict:
+async def iqvia_upload(request: Request) -> dict:
     """Upload an IQVIA Canada Excel file and return a session token.
 
     The file is parsed immediately: the 'data' sheet is read, metric columns
@@ -429,13 +444,26 @@ async def iqvia_upload(file: UploadFile = File(...)) -> dict:
     metrics to the exported workbook.
 
     Tokens are cleared on server restart.
+
+    Note: reads form data directly with a raised max_part_size to bypass
+    Starlette's default 1 MB multipart limit — IQVIA Excel files are 5–30 MB.
     """
     from app.enrichment.iqvia import parse_iqvia, collapse_iqvia, detect_metric_columns
 
-    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" not in content_type:
+        raise HTTPException(400, "Expected a multipart/form-data upload (select an .xlsx file)")
+
+    form = await request.form(max_files=1, max_fields=0, max_part_size=_MAX_UPLOAD_BYTES)
+    file_field = form.get("file")
+    if file_field is None or not hasattr(file_field, "read"):
+        raise HTTPException(400, "No file field in upload — field must be named 'file'")
+
+    filename = getattr(file_field, "filename", "") or ""
+    if not filename.lower().endswith((".xlsx", ".xls")):
         raise HTTPException(400, "File must be an Excel file (.xlsx or .xls)")
 
-    content = await file.read()
+    content = await file_field.read()
     try:
         raw_df = parse_iqvia(content)
     except Exception as exc:
