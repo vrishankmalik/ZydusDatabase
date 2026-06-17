@@ -1673,8 +1673,9 @@ async function uploadIqvia(input) {
     const fd = new FormData();
     fd.append('file', file);
     const resp = await fetch('/api/iqvia/upload', { method: 'POST', body: fd });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+    let data;
+    try { data = await resp.json(); } catch (_) { data = {}; }
+    if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status} — server rejected the file (check it is a valid .xlsx)`);
     _iqviaToken = data.token;
     status.style.color = 'var(--muted)';
     status.textContent = `✓ Loaded`;
