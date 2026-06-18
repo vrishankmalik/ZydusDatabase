@@ -43,6 +43,7 @@ import functools
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import re
 import time
@@ -95,20 +96,36 @@ _PDF_PROCESS_WORKERS = _default_pdf_process_workers()
 _PDF_PROCESS_POOL: Optional[ProcessPoolExecutor] = None
 _PDF_PROCESS_POOL_DISABLED = False
 
+# Hard ceiling on a single PDF's text extraction (seconds).  Generous enough for a
+# large scanned PM under OCR, but bounds any hang so one pathological document — or
+# a wedged worker — can never freeze the whole export.  See _run_extract_core.
+_PDF_EXTRACT_TIMEOUT = float(os.getenv("PDF_EXTRACT_TIMEOUT", "240"))
+
 
 def _get_pdf_process_pool() -> Optional[ProcessPoolExecutor]:
     """Return the shared PDF process pool, or None when disabled/unavailable.
 
     Created lazily on first use.  Pure sync function (no await), so calling it
     from multiple coroutines on the single-threaded event loop is race-free.
+
+    The pool uses a "spawn" start context, NEVER the platform default.  On Linux
+    the default is fork(), which copies the parent's already-running threads
+    (_PDF_THREAD_POOL, the asyncio loop, SQLite) along with whatever mutexes they
+    held at fork time.  A worker that inherits a locked malloc/logging/import mutex
+    deadlocks on first use — and because it hangs rather than raising, the
+    exception-only fallback in _run_extract_core never fires and the export wedges
+    forever.  Spawn starts a fresh interpreter with no inherited locks.
     """
     global _PDF_PROCESS_POOL, _PDF_PROCESS_POOL_DISABLED
     if _PDF_PROCESS_POOL_DISABLED or _PDF_PROCESS_WORKERS <= 1:
         return None
     if _PDF_PROCESS_POOL is None:
         try:
-            _PDF_PROCESS_POOL = ProcessPoolExecutor(max_workers=_PDF_PROCESS_WORKERS)
-            logger.info("PDF process pool created with %d worker(s)", _PDF_PROCESS_WORKERS)
+            ctx = multiprocessing.get_context("spawn")
+            _PDF_PROCESS_POOL = ProcessPoolExecutor(
+                max_workers=_PDF_PROCESS_WORKERS, mp_context=ctx,
+            )
+            logger.info("PDF process pool created with %d spawn worker(s)", _PDF_PROCESS_WORKERS)
         except Exception as exc:
             logger.warning("PDF process pool unavailable (%s) — using in-process extraction", exc)
             _PDF_PROCESS_POOL_DISABLED = True
@@ -2021,15 +2038,28 @@ async def _run_extract_core(
     pool = _get_pdf_process_pool()
     if pool is not None:
         try:
-            return await loop.run_in_executor(pool, _extract_text_core, pdf_bytes, enable_ocr)
+            fut = loop.run_in_executor(pool, _extract_text_core, pdf_bytes, enable_ocr)
+            return await asyncio.wait_for(fut, timeout=_PDF_EXTRACT_TIMEOUT)
+        except asyncio.TimeoutError:
+            # A worker hung (e.g. a deadlocked spawn import, or a pathological PDF).
+            # Don't wait forever — tear the pool down and retry once in-process.
+            logger.warning(
+                "PDF process-pool extraction exceeded %.0fs — disabling pool, retrying in-process",
+                _PDF_EXTRACT_TIMEOUT,
+            )
+            _disable_pdf_process_pool()
         except Exception as exc:
             logger.warning(
                 "PDF process-pool extraction failed (%s) — disabling pool, using in-process", exc,
             )
             _disable_pdf_process_pool()
-    return await loop.run_in_executor(
+    # In-thread fallback, also bounded: if the document itself is what hangs, time
+    # out and let the caller (_process_pdf_group) mark these DINs unenriched rather
+    # than block the whole export.  The orphaned thread is abandoned, not awaited.
+    fut = loop.run_in_executor(
         _PDF_THREAD_POOL, functools.partial(_extract_text_core, pdf_bytes, enable_ocr),
     )
+    return await asyncio.wait_for(fut, timeout=_PDF_EXTRACT_TIMEOUT)
 
 
 async def _extract_text_async(
