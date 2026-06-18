@@ -25,6 +25,14 @@ Usage:
 """
 from __future__ import annotations
 
+import os
+
+# Use all 8 cores for PDF text extraction (the labeling bottleneck) instead of the
+# min(cpu, 4) default.  setdefault, so an explicit env var still wins.  More workers
+# = more concurrent multi-MB PDF transfers through the spawn pipes; if you see
+# "Unable to allocate output buffer" warnings pile up, drop this to 6.
+os.environ.setdefault("PDF_PROCESS_WORKERS", "8")
+
 import uvicorn
 
 if __name__ == "__main__":

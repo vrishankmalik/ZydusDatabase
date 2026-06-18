@@ -48,6 +48,7 @@ import os
 import re
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Callable, Optional
 
 import httpx
@@ -100,6 +101,16 @@ _PDF_PROCESS_POOL_DISABLED = False
 # large scanned PM under OCR, but bounds any hang so one pathological document — or
 # a wedged worker — can never freeze the whole export.  See _run_extract_core.
 _PDF_EXTRACT_TIMEOUT = float(os.getenv("PDF_EXTRACT_TIMEOUT", "240"))
+
+# A transient per-call pool error (e.g. Windows "Unable to allocate output buffer"
+# while pickling multi-MB PDF bytes through the pipe under concurrent load) is NOT a
+# broken pool — the workers are fine, just this one transfer failed.  We retry that
+# PDF in-process and keep the pool for the rest.  But if such errors are *sustained*
+# (genuine memory pressure), retrying the pool every time only adds a doomed transfer
+# before each in-process run, so after this many consecutive transient failures we
+# give up and disable the pool for the run.  See _run_extract_core.
+_PDF_POOL_MAX_TRANSIENT_FAILURES = int(os.getenv("PDF_POOL_MAX_TRANSIENT_FAILURES", "3"))
+_pdf_pool_transient_failures = 0
 
 
 def _get_pdf_process_pool() -> Optional[ProcessPoolExecutor]:
@@ -2030,16 +2041,28 @@ async def _run_extract_core(
     """Run _extract_text_core in the process pool, falling back to the thread pool.
 
     The process pool gives true (non-GIL-bound) parallelism for pdfplumber parsing.
-    Any pool failure — broken pool, OOM-killed worker, pickling/spawn error —
-    disables the pool and re-runs the SAME function in-process, so an export never
-    fails: it just drops to single-process speed.  Output is identical either way.
+    Failures are split into two classes so one transient blip can't serialise the
+    whole export:
+
+    * Fatal (broken pool, wedged-worker timeout) — the pool is unusable, so we
+      disable it for the rest of the run and drop to in-process speed.
+    * Transient (a per-call pickling/transfer error such as the Windows "Unable to
+      allocate output buffer" under concurrent multi-MB transfers) — the workers are
+      fine; we retry THIS PDF in-process but keep the pool for the others.  Only if
+      such errors are sustained (_PDF_POOL_MAX_TRANSIENT_FAILURES in a row) do we
+      give up and disable the pool.
+
+    Output is identical no matter which path runs.
     """
+    global _pdf_pool_transient_failures
     loop = asyncio.get_running_loop()
     pool = _get_pdf_process_pool()
     if pool is not None:
         try:
             fut = loop.run_in_executor(pool, _extract_text_core, pdf_bytes, enable_ocr)
-            return await asyncio.wait_for(fut, timeout=_PDF_EXTRACT_TIMEOUT)
+            result = await asyncio.wait_for(fut, timeout=_PDF_EXTRACT_TIMEOUT)
+            _pdf_pool_transient_failures = 0  # a clean run clears the streak
+            return result
         except asyncio.TimeoutError:
             # A worker hung (e.g. a deadlocked spawn import, or a pathological PDF).
             # Don't wait forever — tear the pool down and retry once in-process.
@@ -2048,11 +2071,30 @@ async def _run_extract_core(
                 _PDF_EXTRACT_TIMEOUT,
             )
             _disable_pdf_process_pool()
-        except Exception as exc:
+        except BrokenProcessPool as exc:
+            # A worker died (OOM-killed, crashed) — the pool can't be reused at all.
             logger.warning(
-                "PDF process-pool extraction failed (%s) — disabling pool, using in-process", exc,
+                "PDF process pool broken (%s) — disabling pool, using in-process", exc,
             )
             _disable_pdf_process_pool()
+        except Exception as exc:
+            # Transient per-call failure: the pool is still alive, just this transfer
+            # failed.  Keep the pool and retry this PDF in-process — unless these are
+            # piling up, in which case the environment is the problem, so disable.
+            _pdf_pool_transient_failures += 1
+            if _pdf_pool_transient_failures >= _PDF_POOL_MAX_TRANSIENT_FAILURES:
+                logger.warning(
+                    "PDF process-pool extraction failed (%s) — %d consecutive transient "
+                    "failures, disabling pool, using in-process",
+                    exc, _pdf_pool_transient_failures,
+                )
+                _disable_pdf_process_pool()
+            else:
+                logger.warning(
+                    "PDF process-pool extraction failed (%s) — retrying this PDF in-process, "
+                    "pool kept alive (transient %d/%d)",
+                    exc, _pdf_pool_transient_failures, _PDF_POOL_MAX_TRANSIENT_FAILURES,
+                )
     # In-thread fallback, also bounded: if the document itself is what hangs, time
     # out and let the caller (_process_pdf_group) mark these DINs unenriched rather
     # than block the whole export.  The orphaned thread is abandoned, not awaited.
