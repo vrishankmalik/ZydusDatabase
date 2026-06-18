@@ -470,6 +470,32 @@ def test_dpd_only_din_excluded_from_sheet():
     assert "02498022" in set(excl["din"].values)
 
 
+def test_noc_only_din_excluded_from_sheet():
+    """A NOC DIN with no matching DPD record is excluded from Sheet 1.
+
+    NOC-only DINs (present in NOC but absent from DPD, e.g. 02272113 / 02272121)
+    carry no DPD product data and must not appear in the export.
+    """
+    from app.enrichment.workbook import build_sheet1
+
+    response = _make_response(
+        dpd_records=[_dpd("02498014")],
+        noc_records=[
+            _noc("02498014"),    # present in both NOC and DPD → appears
+            _noc("02272113"),    # NOC-only → must be excluded
+            _noc("02272121"),    # NOC-only → must be excluded
+        ],
+    )
+    df = build_sheet1(response)
+
+    dins = set(df["din"].astype(str))
+    assert dins == {"02498014"}, (
+        f"Only DINs present in BOTH NOC and DPD should appear, got: {dins}"
+    )
+    assert "02272113" not in dins
+    assert "02272121" not in dins
+
+
 def test_noc_only_column_values_after_filtering():
     """After SNDS/SANDS filtering, only NDS and ANDS appear in noc_submission_type.
 

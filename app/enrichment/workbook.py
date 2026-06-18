@@ -471,8 +471,10 @@ def build_sheet1(
 ) -> pd.DataFrame:
     """Build Sheet 1: one row per DIN, DPD + NOC + patents + labeling + data protection.
 
-    DIN universe is sourced exclusively from NOC. DPD data enriches those DINs
-    but never adds new DINs. DPD-only DINs are excluded; see build_exclusion_list().
+    A DIN appears only when it is present in BOTH NOC and DPD. NOC-only DINs (in
+    NOC but absent from DPD) are excluded — they carry no DPD product data and are
+    not useful in the export (e.g. DINs 02272113, 02272121). DPD-only DINs (in DPD
+    but absent from NOC) are likewise excluded; they appear in build_exclusion_list().
     """
     all_records = [r for s in response.sources for r in s.records]
 
@@ -486,20 +488,26 @@ def build_sheet1(
             r.brand_name, r.source_specific.get("noc_date"),
         )
 
-    # NOC is the authoritative DIN universe; DPD-only DINs are dropped.
+    # A DIN must exist in BOTH NOC and DPD to appear in Sheet 1.
     noc_dins = set(noc_by_din)
-    dpd_only = sorted(set(dpd_by_din) - noc_dins)
+    dpd_dins = set(dpd_by_din)
+    dpd_only = sorted(dpd_dins - noc_dins)
+    noc_only = sorted(noc_dins - dpd_dins)
     if dpd_only:
         logger.info(
             "Excluding %d DPD-only DIN(s) not in NOC for %r: %s",
             len(dpd_only), response.metadata.query, dpd_only,
         )
+    if noc_only:
+        logger.info(
+            "Excluding %d NOC-only DIN(s) not in DPD for %r: %s",
+            len(noc_only), response.metadata.query, noc_only,
+        )
 
-    all_dins = sorted(noc_dins)
+    all_dins = sorted(noc_dins & dpd_dins)
     if not all_dins:
         logger.warning(
-            "No NOC DINs found for %r — Sheet 1 will be empty. "
-            "NOC returned no entries with an attached DIN for this ingredient.",
+            "No DINs present in both NOC and DPD for %r — Sheet 1 will be empty.",
             response.metadata.query,
         )
         return pd.DataFrame()
@@ -619,10 +627,11 @@ def _style_sheet(worksheet: Any, df: pd.DataFrame) -> None:
     from openpyxl.utils import get_column_letter
 
     header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    _center = Alignment(horizontal="center", vertical="center", wrap_text=False)
     for cell in worksheet[1]:
         cell.font = Font(bold=True, name="Calibri", size=10)
         cell.fill = header_fill
-        cell.alignment = Alignment(wrap_text=False)
+        cell.alignment = _center
 
     worksheet.freeze_panes = "A2"
 
@@ -641,6 +650,7 @@ def _style_sheet(worksheet: Any, df: pd.DataFrame) -> None:
     for row in worksheet.iter_rows(min_row=2):
         for cell in row:
             cell.font = Font(name="Calibri", size=10)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 
 def _build_status_sheet(
@@ -818,7 +828,7 @@ def _write_vertical_sheet(
     label_cell.value = "INGREDIENT KEY:"
     label_cell.font = Font(bold=True, name="Calibri", size=10, color="FFFFFF")
     label_cell.fill = KEY_LABEL_FILL
-    label_cell.alignment = Alignment(horizontal="left", vertical="center")
+    label_cell.alignment = Alignment(horizontal="center", vertical="center")
     label_cell.border = CELL_BORDER
 
     for i, (name, color) in enumerate(ingredient_palette):
@@ -885,7 +895,7 @@ def _write_vertical_sheet(
             cell.value = val
             cell.fill = row_fill
             cell.border = CELL_BORDER
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             status_key = str(val).lower().strip() if val is not None else ""
             if col_name == "status" and status_key in _STATUS_COLOR:
                 cell.font = Font(bold=True, name="Calibri", size=10,
@@ -1031,9 +1041,6 @@ def build_workbook_multiproduct(
     ws2 = wb.create_sheet(title="Generic Submissions")
     _write_vertical_sheet(ws2, combined_s2, ingredient_palette)
 
-    if not recon_df.empty:
-        _write_reconciliation_sheet(wb, recon_df)
-
     if source_errors is not None:
         _build_status_sheet_multi(wb, products, source_errors)
 
@@ -1047,7 +1054,8 @@ def _build_status_sheet_multi(
     source_errors: dict[str, Optional[str]],
 ) -> None:
     """Append a ⚠ Source Status sheet when allow_partial=True."""
-    from openpyxl.styles import Font, PatternFill
+    from openpyxl.styles import Alignment, Font, PatternFill
+    _center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     ws = wb.create_sheet(title="⚠ Source Status")
     headers = ["product", "source", "status", "record_count", "error_message", "warning"]
     for col_idx, h in enumerate(headers, 1):
@@ -1055,6 +1063,7 @@ def _build_status_sheet_multi(
         cell.value = h
         cell.font = Font(bold=True, name="Calibri", size=10)
         cell.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+        cell.alignment = _center
 
     row_idx = 2
     for name, response in products:
@@ -1067,6 +1076,8 @@ def _build_status_sheet_multi(
             ws.cell(row=row_idx, column=6).value = (
                 "⚠ DATA MISSING FROM THIS EXPORT" if src.status == "error" else ""
             )
+            for col_idx in range(1, 7):
+                ws.cell(row=row_idx, column=col_idx).alignment = _center
             row_idx += 1
 
 

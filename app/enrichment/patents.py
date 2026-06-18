@@ -185,6 +185,21 @@ def _parse_cpd_date(raw: str) -> Optional[str]:
     return None
 
 
+def _is_expired(expiry_date_str: Optional[str], today: datetime) -> bool:
+    """True only if expiry_date_str is a parseable ISO date strictly before today.
+
+    Unknown / unparseable / flag-string expiry → False (keep the patent: we can't
+    confirm it's expired, so we must not silently drop it).
+    """
+    if not expiry_date_str:
+        return False
+    try:
+        expiry = datetime.strptime(expiry_date_str[:10], "%Y-%m-%d")
+    except ValueError:
+        return False
+    return expiry < today
+
+
 def _compute_expiry(filing_date_str: str, patent_number: str) -> Optional[str]:
     """Compute expiry from filing date when Event History has no explicit expiry row."""
     try:
@@ -707,7 +722,8 @@ async def enrich_patents(
         )
 
     unenriched = [d for d in dins if not _has_dates(d)]
-    already_enriched = [d for d in dins if d not in set(unenriched)]
+    unenriched_set = set(unenriched)
+    already_enriched = [d for d in dins if d not in unenriched_set]
     if already_enriched:
         logger.debug(
             "enrich_patents: skipping %d already-stored DINs: %s",
@@ -743,8 +759,24 @@ async def enrich_patents(
             zero_patent_dins,
         )
 
-    # Enrich each (DIN, patent_number) pair using CPD dates
-    pairs = [(din, pn) for din, pns in din_patent_map.items() for pn in pns]
+    # Enrich each (DIN, patent_number) pair using CPD dates.
+    # Drop patents already known (from the in-memory Patent.zip data) to be expired
+    # BEFORE any per-patent CPD network fetch — expired patents need no enrichment and
+    # firing an HTTP request for each is the dominant cost for large result sets.
+    today = datetime.now()
+
+    def _zip_expiry(pn: str) -> Optional[str]:
+        entry = zip_data.get(_clean_patent_number(pn), zip_data.get(pn, {}))
+        return entry.get("expiry_date")
+
+    all_pairs = [(din, pn) for din, pns in din_patent_map.items() for pn in pns]
+    pairs = [(din, pn) for (din, pn) in all_pairs if not _is_expired(_zip_expiry(pn), today)]
+    skipped_expired = len(all_pairs) - len(pairs)
+    if skipped_expired:
+        logger.info(
+            "Skipping %d expired patent(s) (ZIP expiry < %s); enriching %d live pair(s)",
+            skipped_expired, today.date().isoformat(), len(pairs),
+        )
     total_pairs = len(pairs)
     done_count = 0
 
@@ -768,11 +800,33 @@ async def _enrich_one(
     session_id: str,
     zip_data: dict[str, dict],
 ) -> None:
-    """Fetch CPD dates, cross-check zip, resolve discrepancies, store."""
-    live = await fetch_patent_detail(patent_number, session_id)
+    """Store patent dates.
+
+    Fast path: Patent.zip (downloaded once, already in memory) is authoritative
+    while CPD is broken.  If it has any date for this patent, use it and skip the
+    per-patent live CPD/PR-RDB network fetch entirely — contacting the broken CPD
+    server per patent only adds latency for data we already hold.
+
+    Fallback: a patent absent from the bulk file (zip_entry empty) still attempts
+    the live website fetch, with the original cross-check/discrepancy logging.
+    """
     # zip_data keys are cleaned patent numbers
     clean_pn = _clean_patent_number(patent_number)
     zip_entry: dict = zip_data.get(clean_pn, zip_data.get(patent_number, {}))
+
+    if any(zip_entry.get(f) for f in _DATE_FIELDS):
+        upsert_patent(
+            din=din,
+            patent_number=patent_number,
+            filing_date=zip_entry.get("filing_date"),
+            grant_date=zip_entry.get("grant_date"),
+            expiry_date=zip_entry.get("expiry_date"),
+            detail_url=None,
+        )
+        return
+
+    # Patent missing from the bulk file — fall back to the live website fetch.
+    live = await fetch_patent_detail(patent_number, session_id)
 
     final: dict[str, Optional[str]] = {}
     for field in _DATE_FIELDS:

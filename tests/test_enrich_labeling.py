@@ -336,3 +336,60 @@ class TestPackStyleNeverHeadingFragment:
         from app.enrichment.labeling import _extract_pack_style_from_pdf
         assert _extract_pack_style_from_pdf("Packaging\nEach vial contains 100 mg.") == "Vial"
         assert _extract_pack_style_from_pdf("Packaging\nPrefilled syringe of 2 mL.") == "Prefilled Syringe"
+
+
+# ── regression: section finder must skip prose cross-references ───────────────
+# Root cause of DIN 00878928 (NORVASC) returning no pack_size / pack_style:
+# _find_section matched the FIRST line containing the §6 heading words, even when
+# that line was an in-body cross-reference sentence ending in '.' — so it captured
+# the wrong block and the real §6 (with the packaging text) was never read.
+
+class TestFindSectionSkipsProseCrossReferences:
+    def test_skips_trailing_period_start_and_uses_real_heading(self):
+        from app.enrichment.labeling import _find_section, _S6_MARKERS, _S6_END
+        pages = [
+            # p1: a prose cross-reference that repeats the §6 heading words (ends in '.')
+            (1, "patients should be monitored (see 6 DOSAGE FORMS, STRENGTHS, "
+                "COMPOSITION AND PACKAGING.\nThis is unrelated contraindication text.\n"
+                "7.1.4 Geriatrics)."),
+            # p2: the REAL §6 heading and body
+            (2, "6 DOSAGE FORMS, STRENGTHS, COMPOSITION AND PACKAGING\n"
+                "Supplied in white plastic bottles of 100 tablets.\n"
+                "7 WARNINGS AND PRECAUTIONS"),
+        ]
+        found = _find_section(pages, _S6_MARKERS, _S6_END)
+        assert found is not None
+        page, text = found
+        assert page == 2, f"Should start at the real heading on p2, not the cross-ref on p1; got p{page}"
+        assert "Supplied in white plastic bottles" in text
+        # The cross-reference "7.1.4 Geriatrics)." (ends in '.') must NOT end the section early.
+        assert "WARNINGS" in text or "bottles of 100 tablets" in text
+
+    def test_heading_like_guard(self):
+        from app.enrichment.labeling import _is_section_heading_line
+        assert _is_section_heading_line("6 DOSAGE FORMS, STRENGTHS, COMPOSITION AND PACKAGING")
+        assert _is_section_heading_line("7 WARNINGS AND PRECAUTIONS")
+        assert not _is_section_heading_line("DOSAGE FORMS, STRENGTHS, COMPOSITION AND PACKAGING.")
+        assert not _is_section_heading_line("7.1.4 Geriatrics).")
+
+
+class TestPackScannerMultiContainer:
+    """Packaging scanner must capture every container and not truncate at line breaks."""
+
+    def test_captures_bottle_and_blister_across_sentences(self):
+        from app.enrichment.labeling import _extract_packaging_from_pdf
+        # NORVASC-style §6 body: two containers across two sentences, wrapped over lines.
+        s6 = (
+            "6 DOSAGE FORMS, STRENGTHS, COMPOSITION AND PACKAGING\n"
+            "Supplied in white plastic (high density polyethylene) bottles of 100 tablets\n"
+            "and 250 tablets for each strength. Additionally, the 5 mg strength is supplied\n"
+            "in blister cards of 10 tablets."
+        )
+        size, style = _extract_packaging_from_pdf(s6)
+        assert style is not None and "Bottle" in style and "Blister" in style, (
+            f"Expected both Bottle and Blister, got style={style!r}"
+        )
+        # Verbatim size must not be truncated mid-sentence at the line break.
+        assert size is not None and "for each strength" in size and "blister cards of 10 tablets" in size, (
+            f"Size text truncated or missing a container: {size!r}"
+        )

@@ -43,9 +43,10 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Callable, Optional
 
 import httpx
@@ -65,9 +66,66 @@ _DPD_INFO_BASE = "https://health-products.canada.ca/dpd-bdpp/info"
 # pdfplumber and pytesseract are synchronous; running them in the event loop
 # blocks all concurrent labeling tasks.  A dedicated pool keeps the loop free.
 _PDF_THREAD_POOL = ThreadPoolExecutor(
-    max_workers=int(__import__("os").getenv("PDF_THREAD_WORKERS", "8")),
+    max_workers=int(os.getenv("PDF_THREAD_WORKERS", "8")),
     thread_name_prefix="labeling_pdf",
 )
+
+# ── Process pool for CPU-bound PDF parsing ───────────────────────────────────
+# pdfplumber/pdfminer text extraction is pure-Python and GIL-bound, so a thread
+# pool gives almost NO parallelism — N product monographs parse one-after-another
+# ("1 by 1").  A process pool runs them on separate cores in true parallel.
+#
+# Workers run _extract_text_core(), which does NO SQLite/cache access, so they
+# are process-safe; the OCR-text cache is read/written only in the main process.
+# If the pool can't be created or a worker dies (e.g. OOM on a tiny container),
+# extraction falls back to in-process parsing — output is byte-identical either
+# way, only the speed differs.  Tune with PDF_PROCESS_WORKERS (0 or 1 disables
+# the pool); default is min(cpu_count, 4).
+def _default_pdf_process_workers() -> int:
+    raw = os.getenv("PDF_PROCESS_WORKERS")
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return min((os.cpu_count() or 2), 4)
+
+
+_PDF_PROCESS_WORKERS = _default_pdf_process_workers()
+_PDF_PROCESS_POOL: Optional[ProcessPoolExecutor] = None
+_PDF_PROCESS_POOL_DISABLED = False
+
+
+def _get_pdf_process_pool() -> Optional[ProcessPoolExecutor]:
+    """Return the shared PDF process pool, or None when disabled/unavailable.
+
+    Created lazily on first use.  Pure sync function (no await), so calling it
+    from multiple coroutines on the single-threaded event loop is race-free.
+    """
+    global _PDF_PROCESS_POOL, _PDF_PROCESS_POOL_DISABLED
+    if _PDF_PROCESS_POOL_DISABLED or _PDF_PROCESS_WORKERS <= 1:
+        return None
+    if _PDF_PROCESS_POOL is None:
+        try:
+            _PDF_PROCESS_POOL = ProcessPoolExecutor(max_workers=_PDF_PROCESS_WORKERS)
+            logger.info("PDF process pool created with %d worker(s)", _PDF_PROCESS_WORKERS)
+        except Exception as exc:
+            logger.warning("PDF process pool unavailable (%s) — using in-process extraction", exc)
+            _PDF_PROCESS_POOL_DISABLED = True
+            return None
+    return _PDF_PROCESS_POOL
+
+
+def _disable_pdf_process_pool() -> None:
+    """Disable the process pool for the rest of this run after a worker failure."""
+    global _PDF_PROCESS_POOL, _PDF_PROCESS_POOL_DISABLED
+    _PDF_PROCESS_POOL_DISABLED = True
+    pool, _PDF_PROCESS_POOL = _PDF_PROCESS_POOL, None
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
 # ── Shared httpx client (connection pooling) ──────────────────────────────────
 # Creating a new AsyncClient per request means a fresh TCP+TLS handshake for
@@ -417,13 +475,21 @@ async def _scrape_dpd_info_page(drug_code: int) -> dict[str, Optional[str]]:
 
     Returns: {pdf_url, pdf_date, description}
     """
+    # namespace bumped to _v2: discard pre-fix entries that cached fetch failures
+    # as empty "no PM" results (now distinguished via the "ok" flag below).
     cache_key = f"info:{drug_code}"
-    cached = cache_get("dpd_info_page", cache_key)
+    cached = cache_get("dpd_info_page_v2", cache_key)
     if cached is not None:
         return cached
 
     page_url = f"{_DPD_INFO_BASE}?lang=eng&code={drug_code}"
-    result: dict[str, Optional[str]] = {"pdf_url": None, "pdf_date": None, "description": None}
+    # ok=False until the page is successfully fetched AND parsed.  Callers use this
+    # to tell "page loaded, genuinely no PM link" (ok=True, pdf_url=None) apart from
+    # "fetch failed, PM status unknown" (ok=False) — the latter must NOT be recorded
+    # as a definitive "No PM available" verdict.
+    result: dict[str, Optional[str]] = {
+        "pdf_url": None, "pdf_date": None, "description": None, "ok": False,
+    }
 
     try:
         client = await _get_shared_client()
@@ -432,13 +498,22 @@ async def _scrape_dpd_info_page(drug_code: int) -> dict[str, Optional[str]]:
                 headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
             )
         if r.status_code != 200:
-            logger.debug("DPD info page HTTP %d for drug_code=%s", r.status_code, drug_code)
-            cache_set("dpd_info_page", cache_key, result)
+            # Transient failure (rate-limit, 5xx, etc.) — do NOT cache.  Caching an
+            # empty result here permanently records "No PM available" for this DIN
+            # until the 4 h TTL expires, even though a PM exists.  Returning without
+            # caching lets the next export retry the fetch.
+            logger.warning(
+                "DPD info page HTTP %d for drug_code=%s — not caching (will retry)",
+                r.status_code, drug_code,
+            )
             return result
         soup = BeautifulSoup(r.text, "html.parser")
     except Exception as exc:
-        logger.debug("DPD info page fetch failed for drug_code=%s: %s", drug_code, exc)
-        cache_set("dpd_info_page", cache_key, result)
+        # Network error / timeout — do NOT cache (see note above); retry next run.
+        logger.warning(
+            "DPD info page fetch failed for drug_code=%s: %s — not caching (will retry)",
+            drug_code, exc,
+        )
         return result
 
     for link in soup.find_all("a", href=True):
@@ -494,10 +569,38 @@ async def _scrape_dpd_info_page(drug_code: int) -> dict[str, Optional[str]]:
 
     if result["pdf_url"]:
         logger.debug("drug_code=%s: Labelling PDF → %s", drug_code, result["pdf_url"])
+        result["ok"] = True
     else:
-        logger.info("drug_code=%s: no Labelling PDF link found on DPD info page", drug_code)
+        # No PDF link.  Health Canada publishes an electronic PM for essentially
+        # every marketed product, so "no link" is almost always either a
+        # discontinued DIN or an unexpected page layout — NOT a real absence we
+        # should assert blindly.  HC shows an explicit notice for products with no
+        # electronic PM (typically cancelled/discontinued DINs):
+        #   "Electronic product monograph is not available"
+        # Only when that notice is present is "No PM available" trustworthy.
+        # Otherwise leave ok=False so the caller retries instead of recording a
+        # false verdict.
+        explicit_absent = bool(
+            re.search(r"product\s+monograph\s+is\s+not\s+available", r.text, re.IGNORECASE)
+        )
+        result["ok"] = explicit_absent
+        if explicit_absent:
+            logger.info(
+                "drug_code=%s: PM explicitly not available per DPD page "
+                "(cancelled/discontinued) — recording 'No PM available'",
+                drug_code,
+            )
+        else:
+            logger.warning(
+                "drug_code=%s: no PM link and no explicit 'not available' notice — "
+                "not asserting no-PM (will retry next run)",
+                drug_code,
+            )
 
-    cache_set("dpd_info_page", cache_key, result)
+    # Cache only trustworthy verdicts (PDF found, or PM explicitly absent).
+    # Ambiguous pages (ok=False) are left uncached so the next run retries.
+    if result["ok"]:
+        cache_set("dpd_info_page_v2", cache_key, result)
     return result
 
 
@@ -546,6 +649,10 @@ async def fetch_stage2_data(drug_code: int) -> dict[str, Optional[str]]:
         "pdf_url": info.get("pdf_url"),
         "pdf_date": info.get("pdf_date"),
         "description": info.get("description"),
+        # True when the info page was fetched + parsed successfully (so a None
+        # pdf_url means "genuinely no PM"); False when the fetch failed (PM status
+        # unknown — callers must not persist a "No PM available" verdict).
+        "pdf_lookup_ok": info.get("ok", True),
     }
 
 
@@ -598,28 +705,18 @@ def _ocr_single_page(pdf_bytes: bytes, page_num: int) -> Optional[str]:
         return None
 
 
-def _extract_text_with_ocr(
+def _extract_text_core(
     pdf_bytes: bytes,
-    cache_key: str,
     enable_ocr: bool = True,
-) -> tuple[list[tuple[int, str]], bool]:
-    """Extract text from PDF, OCR'ing pages whose text layer is below threshold.
+) -> tuple[list[tuple[int, str]], bool, list[dict]]:
+    """Pure PDF text extraction — NO cache I/O, safe to run in a worker process.
 
-    Returns:
-      pages     — list of (1-indexed page_num, text_string)
-      ocr_used  — True if at least one page was OCR'd
+    Returns (pages, ocr_used, page_meta).  This is the CPU-bound body shared by
+    the cached wrapper and the process-pool path; it must never touch the SQLite
+    cache so it can execute in a separate process.
     """
     import io
     import pdfplumber  # deferred — optional dependency
-
-    # Check OCR cache (keyed by PDF URL / caller-supplied key)
-    if enable_ocr and cache_key:
-        cached = cache_get("ocr_text", cache_key)
-        if cached is not None:
-            pages = [(p["page"], p["text"]) for p in cached]
-            ocr_used = any(p.get("ocr") for p in cached)
-            logger.debug("OCR text cache hit for key %r (%d pages)", cache_key, len(pages))
-            return pages, ocr_used
 
     pages: list[tuple[int, str]] = []
     ocr_used = False
@@ -665,6 +762,35 @@ def _extract_text_with_ocr(
             pages.append((i, raw_text))
             page_meta.append({"page": i, "text": raw_text, "ocr": used_ocr})
 
+    return pages, ocr_used, page_meta
+
+
+def _extract_text_with_ocr(
+    pdf_bytes: bytes,
+    cache_key: str,
+    enable_ocr: bool = True,
+) -> tuple[list[tuple[int, str]], bool]:
+    """Cached, in-process PDF extraction wrapper around _extract_text_core.
+
+    Returns:
+      pages     — list of (1-indexed page_num, text_string)
+      ocr_used  — True if at least one page was OCR'd
+
+    Kept for the synchronous callers (extract_text_pages, tests).  The async
+    pipeline uses _extract_text_async, which runs _extract_text_core in the
+    process pool and handles the cache in the main process.
+    """
+    # Check OCR cache (keyed by PDF URL / caller-supplied key)
+    if enable_ocr and cache_key:
+        cached = cache_get("ocr_text", cache_key)
+        if cached is not None:
+            pages = [(p["page"], p["text"]) for p in cached]
+            ocr_used = any(p.get("ocr") for p in cached)
+            logger.debug("OCR text cache hit for key %r (%d pages)", cache_key, len(pages))
+            return pages, ocr_used
+
+    pages, ocr_used, page_meta = _extract_text_core(pdf_bytes, enable_ocr)
+
     if enable_ocr and cache_key:
         cache_set("ocr_text", cache_key, page_meta, ttl=60 * 60 * 24 * 7)
 
@@ -688,12 +814,35 @@ def is_scanned(pages: list[tuple[int, str]]) -> bool:
 
 # ── Section finders ───────────────────────────────────────────────────────────
 
+def _is_section_heading_line(line: str) -> bool:
+    """True only when `line` could be a real PM section heading, not prose.
+
+    Section headings ("6 DOSAGE FORMS, STRENGTHS, COMPOSITION AND PACKAGING",
+    "7 WARNINGS AND PRECAUTIONS") never end in sentence punctuation.  In-body
+    cross-references that repeat a heading's words do — e.g.
+        "...see 6 DOSAGE FORMS, STRENGTHS, COMPOSITION AND PACKAGING."
+        "7.1.4 Geriatrics)."
+    These false-positive boundaries are the root cause of _find_section capturing
+    the wrong block (it stops at the first start marker, even a prose one, and
+    ends at the first end marker, even a prose one), so the real section — and the
+    fields scoped to it (packaging, excipients, pH, …) — is missed.  Reject any
+    boundary candidate whose line ends in '.' (covers '…PACKAGING.' and
+    '…Geriatrics).').
+    """
+    return not line.rstrip().endswith(".")
+
+
 def _find_section(
     pages: list[tuple[int, str]],
     start_markers: list[str],
     end_markers: list[str],
 ) -> Optional[tuple[int, str]]:
-    """Find the first section matching any start_marker, return (page_num, text)."""
+    """Find the first section matching any start_marker, return (page_num, text).
+
+    Lines that match a marker but are prose sentences (see _is_section_heading_line)
+    are NOT treated as section boundaries — they are collected as ordinary body text
+    when inside a section, and ignored when looking for the section start.
+    """
     collecting = False
     collected: list[str] = []
     start_page = 0
@@ -703,15 +852,18 @@ def _find_section(
             stripped = line.strip()
             if not collecting:
                 for marker in start_markers:
-                    if re.search(marker, stripped, re.IGNORECASE):
+                    if re.search(marker, stripped, re.IGNORECASE) and _is_section_heading_line(stripped):
                         collecting = True
                         start_page = page_num
                         collected.append(stripped)
                         break
             else:
-                for end_marker in end_markers:
-                    if re.search(end_marker, stripped, re.IGNORECASE):
-                        return start_page, "\n".join(collected)
+                is_end = any(
+                    re.search(end_marker, stripped, re.IGNORECASE)
+                    for end_marker in end_markers
+                )
+                if is_end and _is_section_heading_line(stripped):
+                    return start_page, "\n".join(collected)
                 collected.append(stripped)
 
     if collected:
@@ -989,21 +1141,32 @@ _PACK_STORAGE_RE = re.compile(
 def _scan_for_pack_sentence(text: str) -> Optional[tuple[Optional[str], str]]:
     """Content-first packaging scanner: no section format assumed.
 
-    Splits text into sentences and finds the first one that contains both a
+    Splits text into sentences and aggregates EVERY sentence that contains both a
     container keyword and a non-strength quantity number.  Returns
-    (pack_size_text, container_label) or None.
+    (pack_size_text, container_label) or None, where both fields merge all
+    qualifying sentences with "; " — a PM that lists more than one container
+    (e.g. "...bottles of 100 and 250 tablets. Additionally...blister cards of 10
+    tablets.") yields every container, not just the first.
 
     pack_size_text is verbatim from the PM:
       - "in bottles of 100, 500 and 1000 and in unit dose strips of 100"
       - "in 60 mL and 120 mL plastic bottles"
       - "in aluminium PVC/PCTFE blisters; 56-tablet carton"
     """
+    size_parts: list[str] = []
+    style_labels: list[str] = []
+    seen_styles: set[str] = set()
+
     # Split on sentence-ending punctuation only — not bare newlines.
     # Splitting on \n breaks multi-line packaging sentences like:
     #   "available in the following\ncontainers: 500g jars; 20g and 50g tubes."
     # into two fragments, causing both to fail individual checks.
-    for sent in re.split(r"(?<=[.!?])\s+", text):
-        sent = sent.strip()
+    for raw_sent in re.split(r"(?<=[.!?])\s+", text):
+        # Collapse internal whitespace/newlines so a packaging sentence that wraps
+        # across PDF lines is matched and captured WHOLE.  Without this the verbatim
+        # size text is truncated at the first line break (e.g. "...250 tablets for"),
+        # because the "in ..." capture below uses '.' which does not cross newlines.
+        sent = re.sub(r"\s+", " ", raw_sent).strip()
         if len(sent) < 10:
             continue
         if not _PACK_SCAN_CONTAINER_RE.search(sent):
@@ -1030,16 +1193,24 @@ def _scan_for_pack_sentence(text: str) -> Optional[tuple[Optional[str], str]]:
         label = _extract_pack_style_from_text(sent)
         if not label:
             continue
+        for lbl in label.split("; "):
+            if lbl not in seen_styles:
+                seen_styles.add(lbl)
+                style_labels.append(lbl)
         # Extract the informative slice: "in …" after "available/provided/supplied/…"
         av = re.search(
             r"\b(?:available|provided|supplied|packaged|sold|dispensed)\s+(in\s+\S.+)",
             sent, re.IGNORECASE,
         )
-        size_text: Optional[str] = av.group(1).strip() if av else re.sub(r"\s+", " ", sent.strip())
+        size_text = av.group(1).strip() if av else sent
         if size_text and len(size_text) > 250:
             size_text = size_text[:250].rsplit(" ", 1)[0]
-        return size_text, label
-    return None
+        if size_text and size_text not in size_parts:
+            size_parts.append(size_text)
+
+    if not style_labels:
+        return None
+    return ("; ".join(size_parts) if size_parts else None), "; ".join(style_labels)
 
 
 def _extract_packaging_from_pdf(s6_text: str) -> tuple[Optional[str], Optional[str]]:
@@ -1309,6 +1480,23 @@ def _extract_nonmedicinal_ingredients(s6_text: str) -> Optional[str]:
         if result:
             return result
 
+    # Priority 1d: "The other ingredient(s) are/include: ..." — common ANDS/generic
+    # phrasing inside the Composition block, listing excipients after the active
+    # ingredient is named (e.g. perindopril-amlodipine: "The other ingredients are:
+    # Croscarmellose sodium, microcrystalline cellulose and magnesium stearate.").
+    # No separate "Non-medicinal Ingredients" heading exists in these PMs, so the
+    # heading-anchored patterns above miss the list entirely.
+    other_ingredients_re = re.compile(
+        r"(?:^|\n)[ \t]*[Tt]he\s+other\s+ingredients?\s+(?:are|is|includes?)\s*[:\-]?\s*",
+        re.IGNORECASE,
+    )
+    m1d = other_ingredients_re.search(s6_text)
+    if m1d:
+        after = s6_text[m1d.end():]
+        result = _clean_or_none(_collect_after(after))
+        if result:
+            return result
+
     # Priority 2: block format — heading on its own line (line-start anchor guards PIL).
     m = _NM_HEADING_RE.search(s6_text)
     if m:
@@ -1446,13 +1634,35 @@ _S6_MARKERS = [
     # Older/generic PMs use unnumbered heading: "DOSAGE FORMS, COMPOSITION AND PACKAGING"
     r"^DOSAGE FORMS?,\s*(?:STRENGTHS?,\s*)?COMPOSITION(?!.*\.{4,})",
 ]
-_S6_END = [r"^7[\.\s]+", r"^PART\s+III", r"^CLINICAL\s+PHARMACOLOGY"]
+# Drug-strength units that can follow a leading section number on a §6/§13 table
+# row (e.g. "7 mg / 5 mg", "14 mg / 10 mg").  A numbered end marker must NOT treat
+# such a strength line as the next section heading.  _find_section matches markers
+# case-insensitively, so an upper-case-letter check would not distinguish "7 mg"
+# from "7 WARNINGS" — the guard is an explicit unit list instead.
+_STRENGTH_UNIT = r"(?:mg|mcg|µg|ug|ng|kg|g|ml|l|iu|mmol|meq|%)"
+
+# The numbered end marker requires a heading word (letter, but NOT a strength unit)
+# after "7 " so it matches the real section heading ("7 WARNINGS AND PRECAUTIONS")
+# but NOT a combination/ANDS strength line such as "7 mg / 5 mg" that begins with 7.
+# Without this guard that strength line ends §6 capture immediately, truncating the
+# section to its header and leaving every PDF-sourced field NOT_IN_PM.
+_S6_END = [
+    rf"^7[\.\s]+(?!{_STRENGTH_UNIT}\b)[A-Za-z]",
+    r"^PART\s+III",
+    r"^CLINICAL\s+PHARMACOLOGY",
+]
 
 _S13_MARKERS = [
     r"^13[\.\s]+PHARMACEUTICAL INFORMATION",
     r"^PHARMACEUTICAL INFORMATION(?!.*\.{4,})",
 ]
-_S13_END = [r"^14[\.\s]+", r"^NON-CLINICAL", r"^TOXICOLOGY"]
+# Same strength-line guard as _S6_END: "14 mg / 10 mg" must not be mistaken for
+# the "14 CLINICAL TRIALS" heading and prematurely end §13.
+_S13_END = [
+    rf"^14[\.\s]+(?!{_STRENGTH_UNIT}\b)[A-Za-z]",
+    r"^NON-CLINICAL",
+    r"^TOXICOLOGY",
+]
 
 _DESC_MARKERS = [r"[Dd]escription", r"[Pp]hysical\s+[Dd]escription"]
 _DESC_END = [r"[Cc]omposition", r"[Pp]ackaging", r"[Ss]torage", r"MICROBIOLOGY", r"\n\n\n"]
@@ -1695,6 +1905,7 @@ async def enrich_labeling(
     # Stage 2: DPD API
     stage2 = await fetch_stage2_data(drug_code)
     pdf_url = stage2.pop("pdf_url", None)
+    pdf_lookup_ok = stage2.pop("pdf_lookup_ok", True)
     stage2.pop("pdf_date", None)
     stage2.pop("description", None)
 
@@ -1702,7 +1913,26 @@ async def enrich_labeling(
     if pdf_bytes is None:
         if pdf_url:
             pdf_bytes = await _download_pdf(pdf_url)
+            if pdf_bytes is None:
+                # A PM URL was found but the download failed (timeout / 5xx) — this
+                # is transient.  Do NOT persist a "No PM available" verdict; leave
+                # the DIN unenriched so the next export retries it.
+                logger.warning(
+                    "PM download failed for din=%s (url=%s) — not storing a verdict (will retry)",
+                    din, pdf_url,
+                )
+                return None
+        elif not pdf_lookup_ok:
+            # The DPD info page could not be fetched, so PM status is unknown.  Do
+            # NOT record "No PM available" — leave unenriched so the next run retries.
+            logger.warning(
+                "PM lookup failed for din=%s drug_code=%s — not storing a verdict (will retry)",
+                din, drug_code,
+            )
+            return None
+
         if pdf_bytes is None:
+            # Info page loaded successfully and lists no PM link → genuinely no PM.
             logger.info("No PDF for drug_code=%s din=%s — storing Stage 2 data only", drug_code, din)
             row: dict = {}
             for field in _LABELING_FIELDS:
@@ -1777,31 +2007,53 @@ async def enrich_labeling_batch(
     return dict(zip(din_map.keys(), results))
 
 
+async def _run_extract_core(
+    pdf_bytes: bytes, enable_ocr: bool
+) -> tuple[list[tuple[int, str]], bool, list[dict]]:
+    """Run _extract_text_core in the process pool, falling back to the thread pool.
+
+    The process pool gives true (non-GIL-bound) parallelism for pdfplumber parsing.
+    Any pool failure — broken pool, OOM-killed worker, pickling/spawn error —
+    disables the pool and re-runs the SAME function in-process, so an export never
+    fails: it just drops to single-process speed.  Output is identical either way.
+    """
+    loop = asyncio.get_running_loop()
+    pool = _get_pdf_process_pool()
+    if pool is not None:
+        try:
+            return await loop.run_in_executor(pool, _extract_text_core, pdf_bytes, enable_ocr)
+        except Exception as exc:
+            logger.warning(
+                "PDF process-pool extraction failed (%s) — disabling pool, using in-process", exc,
+            )
+            _disable_pdf_process_pool()
+    return await loop.run_in_executor(
+        _PDF_THREAD_POOL, functools.partial(_extract_text_core, pdf_bytes, enable_ocr),
+    )
+
+
 async def _extract_text_async(
     pdf_bytes: bytes,
     cache_key: str,
     enable_ocr: bool = True,
 ) -> tuple[list[tuple[int, str]], bool]:
-    """Thread-pool + per-URL-dedup wrapper for _extract_text_with_ocr.
+    """Process-pool + per-URL-dedup PDF extraction with main-process caching.
 
-    Two speedups in one:
-    1. Thread pool: pdfplumber/Tesseract run in _PDF_THREAD_POOL so the event
-       loop stays responsive to other concurrent labeling tasks.
-    2. Per-URL serialisation: if two coroutines request the same cache_key
-       concurrently, only the first runs the extraction; the second blocks on
-       the per-URL Lock, then gets a fast OCR-cache hit when it runs.
+    Three speedups:
+    1. Process pool: pdfplumber parsing is pure-Python (GIL-bound), so it runs in
+       _extract_text_core on separate cores for true parallelism (see
+       _run_extract_core for the graceful in-process fallback).
+    2. Per-URL serialisation: concurrent callers for the same PDF URL run the
+       extraction once; the rest get an OCR-cache hit.
+    3. Main-process cache: the OCR-text cache is read/written here (workers do no
+       SQLite I/O, keeping them process-safe).
 
-    Output is byte-for-byte identical to _extract_text_with_ocr — same
-    pdfplumber calls, same Tesseract invocations, same cache reads/writes.
+    Output is byte-for-byte identical to _extract_text_with_ocr.
     """
-    loop = asyncio.get_running_loop()
-
     if not cache_key:
-        # No URL key (test-injected bytes with empty key) — no dedup needed.
-        return await loop.run_in_executor(
-            _PDF_THREAD_POOL,
-            functools.partial(_extract_text_with_ocr, pdf_bytes, cache_key, enable_ocr),
-        )
+        # No URL key (test-injected bytes with empty key) — no cache, no dedup.
+        pages, ocr_used, _meta = await _run_extract_core(pdf_bytes, enable_ocr)
+        return pages, ocr_used
 
     # Acquire a per-URL lock to serialise concurrent extractions for the same
     # PDF URL.  The lock is created lazily under a module-level meta-lock.
@@ -1811,12 +2063,20 @@ async def _extract_text_async(
         url_lock = _PDF_EXTRACT_LOCKS[cache_key]
 
     async with url_lock:
-        # _extract_text_with_ocr checks the OCR text cache at its own start;
-        # a second caller will hit that cache immediately and return in <1 ms.
-        return await loop.run_in_executor(
-            _PDF_THREAD_POOL,
-            functools.partial(_extract_text_with_ocr, pdf_bytes, cache_key, enable_ocr),
-        )
+        # OCR-text cache check in the MAIN process — a second caller for the same
+        # URL hits this immediately and returns in <1 ms.
+        if enable_ocr:
+            cached = cache_get("ocr_text", cache_key)
+            if cached is not None:
+                pages = [(p["page"], p["text"]) for p in cached]
+                ocr_used = any(p.get("ocr") for p in cached)
+                logger.debug("OCR text cache hit for key %r (%d pages)", cache_key, len(pages))
+                return pages, ocr_used
+
+        pages, ocr_used, page_meta = await _run_extract_core(pdf_bytes, enable_ocr)
+        if enable_ocr:
+            cache_set("ocr_text", cache_key, page_meta, ttl=60 * 60 * 24 * 7)
+        return pages, ocr_used
 
 
 async def enrich_labeling_batch_fast(
@@ -1854,11 +2114,25 @@ async def enrich_labeling_batch_fast(
     done_lock = asyncio.Lock()
 
     # ── Step 1: fetch Stage 2 data, deduplicating by drug_code ───────────────
+    # Bound concurrency: each fetch_stage2_data() fans out to 3 Health Canada
+    # requests (active ingredient + packaging + info page).  Firing one per
+    # unique drug_code at once — hundreds for a multi-ingredient metformin-scale
+    # export — saturates the shared client's 40-connection pool, pushing the
+    # info-page fetches past HTTP_TIMEOUT.  Those timeouts previously poisoned the
+    # cache as "No PM available", so every ingredient after the first lost its PMs.
+    # The semaphore keeps the host load bounded (3 × concurrency in flight).
     unique_drug_codes = {dc for dc, _ in din_map.values()}
     stage2_by_dc: dict[int, dict] = {}
+    # Stage 2 calls are lightweight JSON/HTML GETs (3 per drug_code).  The shared
+    # client pools 40 connections, so ~13 drug_codes in flight (≈39 requests) keeps
+    # the pool saturated without the queue-overflow timeouts that unbounded fan-out
+    # caused.  Use a more generous bound than the PDF-download concurrency, which is
+    # heavier (multi-MB downloads + CPU-bound parsing).
+    s2_sem = asyncio.Semaphore(max(concurrency, 13))
 
     async def _fetch_s2(dc: int) -> None:
-        stage2_by_dc[dc] = await fetch_stage2_data(dc)
+        async with s2_sem:
+            stage2_by_dc[dc] = await fetch_stage2_data(dc)
 
     await asyncio.gather(*[_fetch_s2(dc) for dc in unique_drug_codes])
 
@@ -1891,11 +2165,35 @@ async def enrich_labeling_batch_fast(
         pdf_bytes: Optional[bytes] = None
         if pdf_url:
             pdf_bytes = await _download_pdf(pdf_url)
+            if pdf_bytes is None:
+                # A PM URL was found but the download failed (transient).  Do NOT
+                # persist a "No PM available" verdict for any DIN in this group —
+                # leave them unenriched so the next export retries.
+                logger.warning(
+                    "PM download failed for url=%s — not storing a verdict for %d DIN(s) (will retry)",
+                    pdf_url, len(dins_in_group),
+                )
+                for din, _dc, _strength in dins_in_group:
+                    results[din] = None
+                    await _tick_progress(din)
+                return
 
         if pdf_bytes is None:
-            # Stage 2 data only — identical logic to the no-PM branch in enrich_labeling().
+            # No PM URL for this group.  Per-DIN: store "No PM available" only when
+            # the info-page fetch SUCCEEDED (genuine absence); if the fetch failed
+            # (pdf_lookup_ok False), skip so the DIN retries on the next export.
             for din, drug_code, _strength in dins_in_group:
-                s2 = _stage2_fields_only(stage2_by_dc.get(drug_code, {}))
+                s2_full = stage2_by_dc.get(drug_code, {})
+                if not s2_full.get("pdf_lookup_ok", True):
+                    logger.warning(
+                        "PM lookup failed for din=%s drug_code=%s — not storing a verdict (will retry)",
+                        din, drug_code,
+                    )
+                    results[din] = None
+                    await _tick_progress(din)
+                    continue
+                # Stage 2 data only — identical logic to the no-PM branch in enrich_labeling().
+                s2 = _stage2_fields_only(s2_full)
                 row: dict = {}
                 for field in _LABELING_FIELDS:
                     if field in _STAGE2_FIELDS:
@@ -1986,6 +2284,7 @@ def _stage2_fields_only(stage2: dict) -> dict:
     s2.pop("pdf_url", None)
     s2.pop("pdf_date", None)
     s2.pop("description", None)
+    s2.pop("pdf_lookup_ok", None)
     return s2
 
 

@@ -229,3 +229,51 @@ async def test_fetch_drugproduct_list_response(no_cache, monkeypatch):
     async with httpx.AsyncClient() as client:
         result = await dpd_mod._fetch_drugproduct(client, asyncio.Semaphore(1), 99999)
     assert result == prod
+
+
+# ── Combination ingredients are sorted alphabetically (strength stays bound) ──
+
+@pytest.mark.asyncio
+async def test_build_record_sorts_ingredients_alphabetically(no_cache, monkeypatch):
+    """Combination products present ingredients alphabetically, each strength bound
+    to its own ingredient — regardless of the order DPD returns them.
+
+    DPD returns Viacoram as PERINDOPRIL(14) then AMLODIPINE(10); the record must
+    come out AMLODIPINE(10) then PERINDOPRIL(14) so SKU Name, strength, and
+    all_ingredients are canonical and the 10/14-vs-14/10 ambiguity is removed.
+    """
+    async def _product(client, sem, drug_code):
+        return {
+            "drug_identification_number": "02451557",
+            "brand_name": "VIACORAM",
+            "company_name": "SERVIER",
+        }
+
+    async def _empty(client, sem, drug_code):
+        return []
+
+    # DPD returns perindopril FIRST (non-alphabetical), amlodipine second.
+    async def _ings(client, sem, drug_code):
+        return [
+            {"ingredient_name": "PERINDOPRIL ARGININE", "strength": "14", "strength_unit": "MG"},
+            {"ingredient_name": "AMLODIPINE (AMLODIPINE BESYLATE)", "strength": "10", "strength_unit": "MG"},
+        ]
+
+    monkeypatch.setattr(dpd_mod, "_fetch_drugproduct", _product)
+    monkeypatch.setattr(dpd_mod, "_fetch_form", _empty)
+    monkeypatch.setattr(dpd_mod, "_fetch_route", _empty)
+    monkeypatch.setattr(dpd_mod, "_fetch_status", _empty)
+    monkeypatch.setattr(dpd_mod, "_fetch_schedule", _empty)
+    monkeypatch.setattr(dpd_mod, "_fetch_ingredients_by_code", _ings)
+
+    async with httpx.AsyncClient() as client:
+        rec = await dpd_mod._build_record_for_code(client, asyncio.Semaphore(1), 99999, [])
+
+    # Alphabetical: amlodipine before perindopril, each with its OWN strength.
+    assert rec.all_ingredients == [
+        "AMLODIPINE (AMLODIPINE BESYLATE)", "PERINDOPRIL ARGININE",
+    ]
+    assert rec.ingredient == (
+        "AMLODIPINE (AMLODIPINE BESYLATE) 10 MG; PERINDOPRIL ARGININE 14 MG"
+    )
+    assert rec.strength == "10 MG; 14 MG"

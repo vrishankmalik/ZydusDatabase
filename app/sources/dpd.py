@@ -225,6 +225,15 @@ async def _build_record_for_code(
     code_ingredients = all_ing_rows or [
         r for r in ingredient_rows if r.get("drug_code") == drug_code
     ]
+    # Sort ingredients alphabetically by name so combination products present in a
+    # stable, canonical order. ingredient_str (SKU Name), strength, and
+    # all_ingredients are all derived from this same ordered list, so each strength
+    # stays bound to its own ingredient (e.g. "AMLODIPINE ... 10 MG; PERINDOPRIL ...
+    # 14 MG"). This removes the 10/14-vs-14/10 ambiguity when comparing across DINs.
+    code_ingredients = sorted(
+        code_ingredients,
+        key=lambda r: (r.get("ingredient_name") or "").strip().upper(),
+    )
     ingredient_str = "; ".join(
         _format_ingredient(r) for r in code_ingredients
     ) or None

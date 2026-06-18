@@ -131,8 +131,45 @@ def test_parse_patent_zip_empty_returns_empty(monkeypatch):
 # ── unit: discrepancy resolution ──────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_discrepancy_resolved_to_website_value(tmp_path):
-    """When live dates differ from zip dates, store website value and log discrepancy."""
+async def test_zip_dates_used_without_website_fetch(tmp_path):
+    """ZIP-first: when Patent.zip has dates, store them and never hit the website.
+
+    While CPD is broken the bulk file is authoritative, so a patent present in the
+    ZIP skips the per-patent live fetch entirely (the dominant cost). fetch_patent_detail
+    must NOT be called, and the stored dates are the ZIP values.
+    """
+    _reset_store(tmp_path)
+    import app.enrichment.store as store_mod
+
+    from app.enrichment.patents import _enrich_one
+
+    zip_data = {
+        "2709025": {
+            "filing_date": "2008-12-10",
+            "grant_date": "2014-08-26",
+            "expiry_date": "2029-01-01",
+        }
+    }
+
+    fetch_mock = AsyncMock(return_value={
+        "filing_date": "2008-12-10", "grant_date": "2014-08-26",
+        "expiry_date": "2028-12-10", "detail_url": "https://example.com/patent/2709025",
+    })
+    with patch("app.enrichment.patents.fetch_patent_detail", new=fetch_mock):
+        await _enrich_one("02498014", "2709025", "", zip_data)
+
+    fetch_mock.assert_not_awaited()  # website must not be consulted when ZIP has dates
+
+    patents = store_mod.get_patents_for_din("02498014")
+    assert len(patents) == 1
+    assert patents[0]["expiry_date"] == "2029-01-01", "Should use ZIP value (no website fetch)"
+    # No website call → no website-vs-zip comparison → no discrepancy logged.
+    assert store_mod.get_discrepancies() == []
+
+
+@pytest.mark.asyncio
+async def test_website_fetch_only_when_patent_absent_from_zip(tmp_path):
+    """Fallback: a patent missing from the bulk file still attempts the live fetch."""
     _reset_store(tmp_path)
     import app.enrichment.store as store_mod
 
@@ -144,54 +181,17 @@ async def test_discrepancy_resolved_to_website_value(tmp_path):
         "expiry_date": "2028-12-10",
         "detail_url": "https://example.com/patent/2709025",
     }
-    # Zip has a different expiry date
-    zip_data = {
-        "2709025": {
-            "filing_date": "2008-12-10",
-            "grant_date": "2014-08-26",
-            "expiry_date": "2029-01-01",  # differs from live
-        }
-    }
+    zip_data: dict = {}  # patent not in the bulk file
 
-    with patch(
-        "app.enrichment.patents.fetch_patent_detail",
-        new=AsyncMock(return_value=live_dates),
-    ):
+    fetch_mock = AsyncMock(return_value=live_dates)
+    with patch("app.enrichment.patents.fetch_patent_detail", new=fetch_mock):
         await _enrich_one("02498014", "2709025", "", zip_data)
+
+    fetch_mock.assert_awaited_once()  # website IS consulted when ZIP lacks the patent
 
     patents = store_mod.get_patents_for_din("02498014")
     assert len(patents) == 1
-    assert patents[0]["expiry_date"] == "2028-12-10", "Should use website value on discrepancy"
-
-    discrepancies = store_mod.get_discrepancies()
-    assert len(discrepancies) == 1
-    assert discrepancies[0]["field"] == "expiry_date"
-    assert discrepancies[0]["website_value"] == "2028-12-10"
-    assert discrepancies[0]["zip_value"] == "2029-01-01"
-
-
-@pytest.mark.asyncio
-async def test_no_discrepancy_when_dates_match(tmp_path):
-    _reset_store(tmp_path)
-    import app.enrichment.store as store_mod
-
-    from app.enrichment.patents import _enrich_one
-
-    dates = {
-        "filing_date": "2008-12-10",
-        "grant_date": "2014-08-26",
-        "expiry_date": "2028-12-10",
-        "detail_url": None,
-    }
-    zip_data = {"2709025": {k: dates[k] for k in ("filing_date", "grant_date", "expiry_date")}}
-
-    with patch(
-        "app.enrichment.patents.fetch_patent_detail",
-        new=AsyncMock(return_value=dates),
-    ):
-        await _enrich_one("02498014", "2709025", "", zip_data)
-
-    assert store_mod.get_discrepancies() == []
+    assert patents[0]["expiry_date"] == "2028-12-10", "Should use website value (ZIP empty)"
 
 
 # ── unit: DIN with no patents is clean ────────────────────────────────────────

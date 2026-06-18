@@ -220,16 +220,38 @@ async def run_export_job(
             "log": f"All {n} product search{'es' if n > 1 else ''} complete.",
         })
 
-        # ── Stage 2: Patents (all DINs across all products, ONE call) ─────────
-        # Collect unique DINs across all products (order preserved, deduped).
+        # ── Enrichment scope: DINs that will actually appear in Sheet 1 ───────
+        # Sheet 1 keeps only DINs present in BOTH DPD and NOC (see workbook
+        # build_sheet1).  Enriching DPD-only or NOC-only DINs is wasted work — they
+        # are dropped from the output.  Compute the DPD∩NOC intersection once and
+        # use it to scope BOTH patent and labeling enrichment.  For metformin this
+        # cuts the labeling set from every DPD DIN (hundreds) down to only the rows
+        # the user will see.
+        dpd_dins: set[str] = set()
+        noc_dins: set[str] = set()
+        for _, response in product_results:
+            for s in response.sources:
+                if s.source not in ("DPD", "NOC"):
+                    continue
+                for r in s.records:
+                    if _is_excluded_din(r.din):
+                        continue
+                    (dpd_dins if s.source == "DPD" else noc_dins).add(r.din.strip())
+        sheet_dins = dpd_dins & noc_dins
+
+        # ── Stage 2: Patents (DPD∩NOC DINs across all products, ONE call) ─────
+        # Collect unique DINs from DPD records, scoped to sheet_dins (order preserved).
         seen_dins: set[str] = set()
         all_valid_dins: list[str] = []
         for _, response in product_results:
             for s in response.sources:
+                if s.source != "DPD":
+                    continue
                 for r in s.records:
-                    if not _is_excluded_din(r.din) and r.din not in seen_dins:
-                        seen_dins.add(r.din)
-                        all_valid_dins.append(r.din)
+                    din = r.din.strip() if r.din else None
+                    if din and din in sheet_dins and din not in seen_dins:
+                        seen_dins.add(din)
+                        all_valid_dins.append(din)
 
         patent_total = len(all_valid_dins)
 
@@ -286,6 +308,8 @@ async def run_export_job(
                         continue
                     try:
                         din_key = r.din.strip()  # type: ignore[union-attr]
+                        if din_key not in sheet_dins:
+                            continue  # not in Sheet 1 (DPD-only) — don't label it
                         if din_key not in din_map and is_labeling_stale(din_key, LABELING_STORE_TTL):
                             din_map[din_key] = (int(drug_code_raw), r.strength)
                     except (ValueError, TypeError):
@@ -295,7 +319,9 @@ async def run_export_job(
             1 for _, response in product_results
             for s in response.sources if s.source == "DPD"
             for r in s.records
-            if not _is_excluded_din(r.din) and r.source_specific.get("drug_code") is not None
+            if not _is_excluded_din(r.din)
+            and r.din.strip() in sheet_dins
+            and r.source_specific.get("drug_code") is not None
         )
         label_cache_hits = dpd_dins_total - len(din_map)
         label_total = len(din_map)
@@ -391,12 +417,11 @@ async def run_export_job(
                 ),
             })
 
-        xlsx_bytes, sheet1_df, sheet2_df, recon_df = build_workbook_multiproduct(
+        xlsx_bytes, sheet1_df, sheet2_df, _recon_df = build_workbook_multiproduct(
             product_results,
             source_errors=all_error_sources if allow_partial and all_error_sources else None,
             dp_table=dp_table,
             iqvia_df=iqvia_df,
-            debug_iqvia_rows=True,  # temporary: remove before final release
         )
 
         # Snapshot combined flat DataFrames so the dashboard can display them.
@@ -409,24 +434,6 @@ async def run_export_job(
         job.sheet2_records = (
             sheet2_df.where(pd.notna(sheet2_df), None).to_dict("records")
         )
-        if not recon_df.empty:
-            job.recon_columns = list(recon_df.columns)
-            job.recon_records = (
-                recon_df.where(pd.notna(recon_df), None).to_dict("records")
-            )
-            matched = sum(1 for r in job.recon_records if r.get("status") == "matched")
-            ambiguous = sum(1 for r in job.recon_records if r.get("status") == "ambiguous")
-            unmatched_iqvia = sum(1 for r in job.recon_records if r.get("status") == "no_din_match")
-            await emit(job, {
-                "stage": "Workbook", "done": 0, "total": 1,
-                "pct": _overall_pct("Workbook", 0, 1),
-                "elapsed_s": elapsed(), "eta_s": None,
-                "log": (
-                    f"IQVIA matching complete — {matched} matched, "
-                    f"{ambiguous} ambiguous/low-score, "
-                    f"{unmatched_iqvia} IQVIA groups with no DIN match"
-                ),
-            })
 
         fd, path = tempfile.mkstemp(suffix=".xlsx", prefix="cdn_drugs_")
         with os.fdopen(fd, "wb") as fh:
