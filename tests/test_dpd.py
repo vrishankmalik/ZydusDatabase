@@ -55,6 +55,39 @@ async def test_dpd_din_search():
     assert result.status in ("ok", "no_results")
 
 
+@pytest.mark.integration
+async def test_dpd_dosage_form_golden():
+    """dosage_form is captured per DIN from the already-fetched /form/ endpoint.
+
+    Golden values were observed from an actual DPD run on 2026-06-18; they are
+    pinned here, never hand-entered.  Every anchor resolves to a non-blank form.
+
+        02567709 ORTHOXICAM     → Solution
+        02334992 ENDOMETRIN     → Vaginal Tablet, Effervescent
+        02505223 BIJUVA         → Capsule
+        02515504 INPROSUB       → Solution
+        00030848 DEPO-PROVERA   → Suspension
+    """
+    golden = {
+        "02567709": "Solution",
+        "02334992": "Vaginal Tablet, Effervescent",
+        "02505223": "Capsule",
+        "02515504": "Solution",
+        "00030848": "Suspension",
+    }
+    for din, expected_form in golden.items():
+        result = await search_dpd(din, field="din")
+        assert result.status == "ok", (
+            f"{din}: expected ok, got {result.status}: {result.error_message}"
+        )
+        assert result.records, f"{din}: no records returned"
+        form = result.records[0].dosage_form
+        assert form and form.strip(), f"{din}: dosage_form must be non-blank, got {form!r}"
+        assert form == expected_form, (
+            f"{din}: dosage_form changed — expected {expected_form!r}, got {form!r}"
+        )
+
+
 def test_sync_wrapper():
     """Smoke test that the async function is importable and callable."""
     from app.sources.dpd import search_dpd as fn

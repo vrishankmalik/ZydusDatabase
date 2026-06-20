@@ -440,6 +440,46 @@ async def run_export_job(
             fh.write(xlsx_bytes)
         job.result_path = path
 
+        # ── Optional Stage 6: go/no-go screening (filtered export) ────────────
+        # Runs over the just-built workbook data (sheet1_df/sheet2_df) — no extra
+        # scraping. Produces a two-tab Summary + Detail filtered workbook.
+        filtered_bytes: Optional[bytes] = None
+        if job.filter_criteria:
+            from app.enrichment.screen import build_filtered_workbook, parse_criteria
+            try:
+                criteria = parse_criteria(job.filter_criteria)
+                filtered_bytes, summary_out, _detail_out, screen_warnings = (
+                    build_filtered_workbook(sheet1_df, sheet2_df, criteria)
+                )
+                for label in screen_warnings:
+                    await emit(job, {
+                        "stage": "Workbook", "done": 1, "total": 1,
+                        "pct": 1.0, "elapsed_s": elapsed(), "eta_s": 0,
+                        "log": (
+                            f"⚠ Product {label!r} has a blank dosage form — "
+                            "grouped on its own; please verify the source data."
+                        ),
+                    })
+                job.summary_columns = list(summary_out.columns)
+                job.summary_records = (
+                    summary_out.where(pd.notna(summary_out), None).to_dict("records")
+                )
+                fd_f, path_f = tempfile.mkstemp(suffix=".xlsx", prefix="cdn_drugs_filtered_")
+                with os.fdopen(fd_f, "wb") as fh:
+                    fh.write(filtered_bytes)
+                job.filtered_result_path = path_f
+                await emit(job, {
+                    "stage": "Workbook", "done": 1, "total": 1,
+                    "pct": 1.0, "elapsed_s": elapsed(), "eta_s": 0,
+                    "log": (
+                        f"Filtered workbook ready — {len(summary_out)} qualifying "
+                        f"product(s), {len(filtered_bytes):,} bytes"
+                    ),
+                })
+            except Exception as exc:
+                logger.exception("Filtered screening failed for job %s", job.job_id)
+                raise RuntimeError(f"Filtered screening failed: {exc}") from exc
+
         total_elapsed = elapsed()
         await emit(job, {
             "stage": "Workbook", "done": 1, "total": 1,
@@ -448,12 +488,15 @@ async def run_export_job(
         })
 
         job.status = "complete"
-        await emit(job, {
+        complete_event = {
             "status": "complete",
             "download_url": f"/export/result/{job.job_id}",
             "elapsed_s": total_elapsed,
             "log": f"Done in {total_elapsed}s",
-        })
+        }
+        if filtered_bytes is not None:
+            complete_event["filtered_download_url"] = f"/export/filtered-result/{job.job_id}"
+        await emit(job, complete_event)
 
     except Exception as exc:
         logger.exception("Export job %s failed", job.job_id)

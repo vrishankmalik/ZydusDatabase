@@ -963,6 +963,120 @@ def test_depo_provera_reason_for_supplement_aligned():
     assert "2003-09-15" in noc_date_lines[2]
 
 
+# ── Fix 5: dosage_form is Sheet 1's 3rd column (after Ingredient Name) ───────
+#
+# dosage_form is captured in app/sources/dpd.py from the /form/ endpoint that is
+# already fetched for every drug_code, so surfacing it adds ZERO network requests.
+# These tests pin its canonical position and header in Sheet 1.
+
+def _dpd_form(din: str, dosage_form: str, brand: str = "BRAND") -> DrugRecord:
+    return DrugRecord(
+        source="DPD",
+        din=din,
+        brand_name=brand,
+        company="Novartis",
+        ingredient="alpelisib",
+        strength="50 mg",
+        dosage_form=dosage_form,
+        all_ingredients=["alpelisib"],
+    )
+
+
+def test_dosage_form_is_third_column_after_ingredient(tmp_path):
+    """dosage_form must be the 3rd Sheet 1 column: DIN → Ingredient Name → Dosage Form → SKU Name."""
+    import app.enrichment.store as store_mod
+    store_mod.reset_for_testing(str(tmp_path / "enrich.db"))
+
+    from app.enrichment.workbook import build_sheet1
+
+    response = _make_response(dpd_records=[_dpd_form("02498014", "Solution")])
+    df = build_sheet1(response)
+    cols = list(df.columns)
+
+    assert "dosage_form" in cols, "dosage_form column missing from Sheet 1"
+    idx = cols.index("dosage_form")
+    assert idx == 2, (
+        f"dosage_form must be the 3rd column (index 2), got index {idx}: {cols[:5]}"
+    )
+    # Sits immediately after Ingredient Name and before SKU Name.
+    assert cols[idx - 1] == "ingredient_name"
+    assert cols[idx + 1] == "ingredient"
+    # Value flows straight from the DPD record — never inferred.
+    row = df[df["din"] == "02498014"].iloc[0]
+    assert row["dosage_form"] == "Solution"
+
+
+def test_xlsx_dosage_form_header_and_position(tmp_path):
+    """XLSX (single-product /api/export path): dosage_form is column C, right after
+    ingredient_name and before the SKU Name (ingredient) column.
+
+    This path renames only the _HEADER_DISPLAY keys (din → DIN, ingredient → SKU
+    Name); the remaining headers keep their raw snake_case key, so dosage_form's
+    casing matches its siblings ingredient_name / brand_name exactly.
+    """
+    import openpyxl
+    import app.enrichment.store as store_mod
+    store_mod.reset_for_testing(str(tmp_path / "enrich.db"))
+
+    from app.enrichment.workbook import build_workbook
+
+    response = _make_response(
+        dpd_records=[_dpd_form("02498014", "Solution")],
+        noc_records=[_noc("02498014")],
+    )
+    xlsx = build_workbook(response)
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx))
+    ws = wb["DPD + NOC + Patents"]
+    headers = [cell.value for cell in ws[1]]
+
+    assert headers[:5] == [
+        "DIN", "ingredient_name", "dosage_form", "SKU Name", "brand_name",
+    ], f"Unexpected leading header order: {headers[:5]}"
+
+
+def test_xlsx_multiproduct_dosage_form_header_title_cased(tmp_path):
+    """XLSX (async export-job / multiproduct path): headers are title-cased via
+    _col_to_header, so the order reads DIN, Ingredient Name, Dosage Form, SKU Name,
+    Brand Name — dosage_form again 3rd and cased like its siblings.
+    """
+    import openpyxl
+    import app.enrichment.store as store_mod
+    store_mod.reset_for_testing(str(tmp_path / "enrich.db"))
+
+    from app.enrichment.workbook import build_workbook_multiproduct
+
+    response = _make_response(
+        dpd_records=[_dpd_form("02498014", "Solution")],
+        noc_records=[_noc("02498014")],
+        query="alpelisib",
+    )
+    xlsx_bytes, _s1, _s2, _recon = build_workbook_multiproduct([("alpelisib", response)])
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+    ws = wb["DPD + NOC + Patents"]
+    # Row 1 is the ingredient key row; the column headers live on row 2.
+    headers = [cell.value for cell in ws[2]]
+
+    assert headers[:5] == [
+        "DIN", "Ingredient Name", "Dosage Form", "SKU Name", "Brand Name",
+    ], f"Unexpected leading header order: {headers[:5]}"
+
+
+def test_blank_dosage_form_left_blank_not_inferred(tmp_path):
+    """A DPD record with no dosage_form yields a blank cell — never a fabricated value."""
+    import app.enrichment.store as store_mod
+    store_mod.reset_for_testing(str(tmp_path / "enrich.db"))
+
+    from app.enrichment.workbook import build_sheet1
+
+    response = _make_response(dpd_records=[_dpd_form("02498014", None)])  # type: ignore[arg-type]
+    df = build_sheet1(response)
+    row = df[df["din"] == "02498014"].iloc[0]
+    val = row["dosage_form"]
+    assert val is None or str(val) in ("None", "nan", ""), (
+        f"Missing dosage_form must stay blank, got {val!r}"
+    )
+
+
 def test_noc_column_line_counts_match_multi_noc():
     """For any multi-NOC DIN, all five per-NOC columns must have equal line counts."""
     from app.enrichment.workbook import build_sheet1

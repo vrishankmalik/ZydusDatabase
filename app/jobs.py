@@ -18,6 +18,8 @@ class JobState:
     # Signalled whenever a new event is appended
     _notify: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
     result_path: Optional[str] = None
+    # Filtered (go/no-go screened) workbook — set only when filter_criteria given.
+    filtered_result_path: Optional[str] = None
     error: Optional[str] = None
     created_at: float = dataclasses.field(default_factory=time.time)
     # Snapshot of the final Sheet 1 and Sheet 2 DataFrames (identical to what
@@ -30,10 +32,15 @@ class JobState:
     # Optional IQVIA reconciliation snapshot (set only when IQVIA data was provided).
     recon_columns: list[str] = dataclasses.field(default_factory=list)
     recon_records: list[dict] = dataclasses.field(default_factory=list)
+    # Optional go/no-go screening summary snapshot (set only when filter_criteria given).
+    summary_columns: list[str] = dataclasses.field(default_factory=list)
+    summary_records: list[dict] = dataclasses.field(default_factory=list)
     # Token referencing the pre-parsed IQVIA DataFrame in the server-side store.
     iqvia_token: Optional[str] = None
     # When True, append "IQVIA Source Rows (debug)" column to Sheet 1 output.
     debug_iqvia_rows: bool = False
+    # Raw go/no-go criteria dicts ({metric, operator, value}); empty → full export only.
+    filter_criteria: list[dict] = dataclasses.field(default_factory=list)
 
 
 _jobs: dict[str, JobState] = {}
@@ -46,6 +53,7 @@ def create_job(
     queries: Optional[list[str]] = None,
     iqvia_token: Optional[str] = None,
     debug_iqvia_rows: bool = False,
+    filter_criteria: Optional[list[dict]] = None,
 ) -> JobState:
     effective_queries = queries or [query]
     job = JobState(
@@ -55,6 +63,7 @@ def create_job(
         queries=effective_queries,
         iqvia_token=iqvia_token,
         debug_iqvia_rows=debug_iqvia_rows,
+        filter_criteria=filter_criteria or [],
     )
     _jobs[job_id] = job
     return job

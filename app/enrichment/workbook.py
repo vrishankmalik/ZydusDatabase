@@ -115,7 +115,8 @@ _NEVER_DROP_COLS = frozenset({
 _SHEET1_COLS = (
     "din",
     "ingredient_name",
-    "ingredient", "brand_name", "company", "strength", "dosage_form",
+    "dosage_form",
+    "ingredient", "brand_name", "company", "strength",
     "route", "status", "_drug_code", "_schedule",
     "noc_date", "reason_for_supplement", "submission_class",
     "noc_submission_type", "noc_therapeutic_class",

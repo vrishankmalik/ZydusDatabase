@@ -520,6 +520,9 @@ class ExportStartRequest(BaseModel):
     enable_ocr: bool = True
     iqvia_token: Optional[str] = None  # token from /api/iqvia/upload
     debug_iqvia_rows: bool = False     # append "IQVIA Source Rows (debug)" column to Sheet 1
+    # Go/no-go screening criteria; each {metric, operator, value}. When non-empty,
+    # the job ALSO produces a filtered Summary+Detail workbook over the built data.
+    filter_criteria: list[dict] = []
 
 
 def _resolve_queries(req: ExportStartRequest) -> list[str]:
@@ -553,6 +556,7 @@ async def export_start(req: ExportStartRequest) -> dict:
         job_id, qs[0], req.field, queries=qs,
         iqvia_token=req.iqvia_token,
         debug_iqvia_rows=req.debug_iqvia_rows,
+        filter_criteria=req.filter_criteria,
     )
     asyncio.create_task(
         run_export_job(job, req.allow_partial, req.enable_ocr)
@@ -633,6 +637,28 @@ async def export_result(job_id: str) -> FileResponse:
     )
 
 
+@app.get("/export/filtered-result/{job_id}")
+async def export_filtered_result(job_id: str) -> FileResponse:
+    """Download the finished filtered (go/no-go screened) XLSX."""
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job.status != "complete":
+        raise HTTPException(409, f"Job not complete (status={job.status})")
+    if not job.filtered_result_path:
+        raise HTTPException(404, "No filtered workbook for this job (no criteria provided)")
+    qs = job.queries or [job.query]
+    if len(qs) == 1:
+        filename = f"filtered_{qs[0].replace(' ', '_')}_{job.field}.xlsx"
+    else:
+        filename = f"filtered_{len(qs)}_products_{job.field}.xlsx"
+    return FileResponse(
+        path=job.filtered_result_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
+    )
+
+
 @app.get("/api/export-data/{job_id}")
 async def export_data_json(job_id: str) -> dict:
     """Return Sheet 1 and Sheet 2 as JSON — the exact dataset written to the XLSX.
@@ -658,6 +684,11 @@ async def export_data_json(job_id: str) -> dict:
         result["reconciliation"] = {
             "columns": job.recon_columns,
             "records": job.recon_records,
+        }
+    if job.summary_columns:
+        result["summary"] = {
+            "columns": job.summary_columns,
+            "records": job.summary_records,
         }
     return result
 
@@ -1158,8 +1189,8 @@ _HTML_UI = """<!DOCTYPE html>
       </div>
       <div class="field-group" style="justify-content:flex-end; gap:6px; margin-top:12px;">
         <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-          <button class="btn btn-primary" id="searchBtn" onclick="doSearch()">Search</button>
-          <button class="btn btn-export" id="exportBtn" onclick="doExport()" disabled>⬇ Export XLSX</button>
+          <button class="btn btn-export" id="exportBtn" onclick="doExport(false)" title="Build the full two-tab enriched workbook (DPD+NOC+Patents and Generic Submissions)">⬇ Download Excel</button>
+          <button class="btn btn-primary" id="filterBtn" onclick="doExport(true)" title="Screen products against the go/no-go criteria below, then export a filtered Summary + Detail workbook">⬇ Download Filtered Excel</button>
           <button class="btn" style="background:#888;color:white;" onclick="resetAllCaches()" title="Clear all cached data and force fresh fetches from all sources">Reset cache</button>
         </div>
         <div style="display:flex; align-items:center; gap:8px; margin-top:8px; flex-wrap:wrap;">
@@ -1173,6 +1204,18 @@ _HTML_UI = """<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <!-- Go/No-Go screening criteria — used only by the "Download Filtered Excel" action. -->
+    <details class="filter-box" id="filterBox" style="margin-top:14px;border:1px solid var(--border);border-radius:4px;padding:0 14px;background:#fff;">
+      <summary style="cursor:pointer;font-weight:600;font-size:0.9rem;color:var(--primary-dark);padding:11px 2px;list-style:revert;">
+        Go / No-Go Filter Criteria
+        <span style="font-weight:400;color:var(--muted);font-size:0.78rem">&nbsp;— optional; fill only the rows you want. All filled rows are combined with AND.</span>
+      </summary>
+      <div id="criteriaRows" style="padding:4px 0 6px;display:flex;flex-direction:column;gap:7px;"></div>
+      <div id="iqviaCritNote" style="font-size:0.74rem;color:var(--warn);padding-bottom:11px;display:none;">
+        ⚠ Value / Quantity criteria require an IQVIA file — upload one above to enable them.
+      </div>
+    </details>
   </div>
 
   <!-- Export progress panel (shown while job runs) -->
@@ -1186,9 +1229,6 @@ _HTML_UI = """<!DOCTYPE html>
     </div>
     <div class="export-log" id="exportLog"></div>
   </div>
-
-  <div class="ai-summary" id="aiSummary"></div>
-  <div id="results"></div>
 
   <!-- Dashboard panel: shown after export completes; renders exact XLSX dataset -->
   <div class="dashboard-panel" id="dashboardPanel">
@@ -1216,63 +1256,9 @@ _HTML_UI = """<!DOCTYPE html>
 </footer>
 
 <script>
-const SOURCE_LABELS = {
-  DPD: 'Drug Product Database (DPD)',
-  GenericSubmissions: 'Generic Submissions Under Review',
-  NOC: 'Notice of Compliance',
-  PatentRegister: 'Patent Register',
-};
-
-const SOURCE_COLS = {
-  Combined: [
-    { key: 'source', label: 'Source' },
-    { key: 'ingredient', label: 'Ingredient(s)' },
-    { key: 'brand_name', label: 'Brand' },
-    { key: 'company', label: 'Company' },
-    { key: 'din', label: 'DIN' },
-    { key: 'strength', label: 'Strength' },
-    { key: 'dosage_form', label: 'Form' },
-    { key: 'status', label: 'Status' },
-  ],
-  DPD: [
-    { key: 'brand_name', label: 'Brand Name' },
-    { key: 'ingredient', label: 'Ingredient(s)' },
-    { key: 'company', label: 'Company' },
-    { key: 'din', label: 'DIN' },
-    { key: 'strength', label: 'Strength' },
-    { key: 'dosage_form', label: 'Form' },
-    { key: 'route', label: 'Route' },
-    { key: 'status', label: 'Status' },
-  ],
-  GenericSubmissions: [
-    { key: 'ingredient', label: 'Medicinal Ingredient(s)' },
-    { key: 'company', label: 'Company' },
-    { key: '_therapeutic_area', label: 'Therapeutic Area' },
-    { key: '_date_accepted', label: 'Date Accepted' },
-    { key: 'status', label: 'Status' },
-  ],
-  NOC: [
-    { key: 'brand_name', label: 'Product(s)' },
-    { key: 'ingredient', label: 'Medicinal Ingredient(s)' },
-    { key: 'company', label: 'Manufacturer' },
-    { key: 'din', label: 'DIN(s)' },
-    { key: '_noc_date', label: 'NOC Date' },
-    { key: 'status', label: 'NOC Type' },
-  ],
-  PatentRegister: [
-    { key: 'ingredient', label: 'Medicinal Ingredient' },
-    { key: 'brand_name', label: 'Brand Name' },
-    { key: 'strength', label: 'Strength' },
-    { key: 'dosage_form', label: 'Dosage Form' },
-    { key: 'din', label: 'DIN' },
-    { key: '_patent_number', label: 'Patent' },
-    { key: '_csp', label: 'CSP' },
-  ],
-};
-
-let lastResponse = null;
 let currentJobId = null;
 let currentEventSource = null;
+let _exportMode = 'full';  // 'full' | 'filtered' — which download to trigger on complete
 
 // ---- Multi-ingredient query parsing ----
 
@@ -1300,9 +1286,9 @@ function updateQueryCount() {
   if (qs.length === 0) {
     hint.textContent = '';
   } else if (qs.length === 1) {
-    hint.textContent = `1 ingredient: Search previews it; Export runs it.`;
+    hint.textContent = `1 ingredient — exported on its own.`;
   } else {
-    hint.textContent = `${qs.length} ingredients: ${qs.map(q => '”' + q + '”').join(', ')}. Search previews the first; Export runs all side-by-side.`;
+    hint.textContent = `${qs.length} ingredients: ${qs.map(q => '”' + q + '”').join(', ')} — exported side-by-side.`;
   }
 }
 
@@ -1310,199 +1296,70 @@ function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-function fieldVal(record, key) {
-  if (key.startsWith('_')) return (record.source_specific || {})[key.slice(1)] || '';
-  return record[key] || '';
+// ---- Go/No-Go filter criteria form ----
+
+// The six screening criteria. iqvia=true rows are disabled until an IQVIA file
+// is loaded (their sums require IQVIA metric columns).
+const CRITERIA_DEFS = [
+  { metric: 'competitors',  label: 'Number of Competitors',     iqvia: false },
+  { metric: 'filings',      label: 'Number of Filings',          iqvia: false },
+  { metric: 'approvals',    label: 'Number of Approvals',        iqvia: false },
+  { metric: 'value',        label: 'Value Sizeable ($)',         iqvia: true  },
+  { metric: 'quantity',     label: 'Quantity Sizeable (Units)',  iqvia: true  },
+  { metric: 'quantity_ext', label: 'Quantity Ext Sizeable',      iqvia: true  },
+];
+
+function buildCriteriaRows() {
+  const wrap = document.getElementById('criteriaRows');
+  wrap.innerHTML = CRITERIA_DEFS.map(d => `
+    <div class="crit-row" data-metric="${d.metric}" data-iqvia="${d.iqvia}"
+         style="display:flex;align-items:center;gap:9px;flex-wrap:wrap;">
+      <label style="display:flex;align-items:center;gap:7px;min-width:230px;font-size:0.86rem;cursor:pointer;">
+        <input type="checkbox" id="crit_${d.metric}_on">
+        <span>${d.label}</span>
+      </label>
+      <select id="crit_${d.metric}_op" style="padding:4px 8px;border:1px solid var(--border);border-radius:3px;font-size:0.84rem;">
+        <option value="above">above</option>
+        <option value="below">below</option>
+        <option value="exactly">exactly</option>
+      </select>
+      <input type="number" id="crit_${d.metric}_val" step="any" placeholder="value"
+        style="width:130px;padding:4px 8px;border:1px solid var(--border);border-radius:3px;font-size:0.84rem;">
+    </div>`).join('');
+  setIqviaCriteriaEnabled(!!_iqviaToken);
 }
 
-// ---- Combination grouping helpers ----
-
-function normalizeIngName(s) {
-  return s.trim().toUpperCase().replace(/\s+/g, ' ');
-}
-
-function makeGroupKey(record) {
-  let names;
-  if (record.all_ingredients && record.all_ingredients.length > 0) {
-    names = record.all_ingredients.map(normalizeIngName).filter(Boolean);
-  } else if (record.ingredient) {
-    names = record.ingredient.split(/\s*;\s*/).map(normalizeIngName).filter(Boolean);
-  } else {
-    return 'UNKNOWN / UNPARSED';
-  }
-  names = [...new Set(names)].sort();
-  return names.length ? names.join(' + ') : 'UNKNOWN / UNPARSED';
-}
-
-function groupAndSort(records, searchedIngredient) {
-  const map = {};
-  for (const rec of records) {
-    const key = makeGroupKey(rec);
-    if (!map[key]) map[key] = [];
-    map[key].push(rec);
-  }
-  const searchKey = searchedIngredient ? normalizeIngName(searchedIngredient) : null;
-  return Object.entries(map)
-    .map(([label, recs]) => ({ label, records: recs }))
-    .sort((a, b) => {
-      const ae = searchKey && a.label === searchKey ? 0 : 1;
-      const be = searchKey && b.label === searchKey ? 0 : 1;
-      if (ae !== be) return ae - be;
-      if (b.records.length !== a.records.length) return b.records.length - a.records.length;
-      return a.label.localeCompare(b.label);
-    });
-}
-
-// ---- Table + grouped-view builders ----
-
-function buildTable(source, records) {
-  const cols = SOURCE_COLS[source] || SOURCE_COLS.Combined;
-  let html = '<table><thead><tr>';
-  cols.forEach(c => { html += `<th>${c.label}</th>`; });
-  html += '<th>Link</th></tr></thead><tbody>';
-  records.forEach(r => {
-    html += '<tr>';
-    cols.forEach(c => {
-      let v;
-      if (c.key === 'source') {
-        v = `<span class="badge badge-${r.source}" style="font-size:.7rem">${r.source}</span>`;
-      } else {
-        v = fieldVal(r, c.key);
-        v = v ? escHtml(v) : '<span style="color:#aaa">-</span>';
-      }
-      html += `<td>${v}</td>`;
-    });
-    const link = r.record_url
-      ? `<a class="record-link" href="${escHtml(r.record_url)}" target="_blank" rel="noopener">View ↗</a>`
-      : '-';
-    html += `<td>${link}</td></tr>`;
+// Enable/disable the IQVIA-dependent criteria (Value/Quantity/Quantity Ext).
+function setIqviaCriteriaEnabled(enabled) {
+  document.querySelectorAll('.crit-row[data-iqvia="true"]').forEach(row => {
+    row.style.opacity = enabled ? '1' : '0.45';
+    row.querySelectorAll('input, select').forEach(el => { el.disabled = !enabled; });
+    if (!enabled) {
+      const cb = row.querySelector('input[type="checkbox"]');
+      if (cb) cb.checked = false;
+    }
   });
-  html += '</tbody></table>';
-  return html;
+  const note = document.getElementById('iqviaCritNote');
+  if (note) note.style.display = enabled ? 'none' : 'block';
 }
 
-function buildGroupedView(source, records, searchedIngredient) {
-  if (!records.length) return '<div class="info-box">No results.</div>';
-  const groups = groupAndSort(records, searchedIngredient);
-  return groups.map((g, i) => {
-    const companies = [...new Set(g.records.map(r => r.company).filter(Boolean))].sort();
-    const chips = companies.slice(0, 6).map(c => `<span class="company-chip">${escHtml(c)}</span>`).join('')
-      + (companies.length > 6 ? `<span class="company-chip more">+${companies.length - 6} more</span>` : '');
-    return `<details class="combo-group"${i === 0 ? ' open' : ''}>
-<summary class="combo-header">
-  <span class="combo-label">${escHtml(g.label)}</span>
-  <span class="combo-stats">${g.records.length} product${g.records.length !== 1 ? 's' : ''} &middot; ${companies.length} compan${companies.length !== 1 ? 'ies' : 'y'}</span>
-  <div class="combo-companies">${chips}</div>
-</summary>
-<div class="combo-body">${buildTable(source, g.records)}</div>
-</details>`;
-  }).join('');
-}
-
-function buildSourcePane(src, searchedIngredient) {
-  const statusClass = `status-${src.status}`;
-  let content = '';
-  if (src.status === 'ok' && src.records.length) {
-    content = buildGroupedView(src.source, src.records, searchedIngredient);
-  } else if (src.status === 'no_results') {
-    content = '<div class="info-box">No results found in this database for your query.</div>';
-  } else if (src.status === 'error' || src.status === 'timeout') {
-    content = `<div class="error-box"><strong>${src.status === 'timeout' ? 'Timeout' : 'Error'}:</strong> ${escHtml(src.error_message || 'Unknown error')}</div>`;
-  } else if (src.status === 'unsupported') {
-    content = `<div class="info-box">ℹ️ ${escHtml(src.error_message || 'This source does not support the selected search field.')}</div>`;
+// Collect the enabled, filled-in criteria as request dicts. Throws (message) if a
+// checked row has no value.
+function collectCriteria() {
+  const out = [];
+  for (const d of CRITERIA_DEFS) {
+    const cb = document.getElementById(`crit_${d.metric}_on`);
+    if (!cb || !cb.checked || cb.disabled) continue;
+    const op = document.getElementById(`crit_${d.metric}_op`).value;
+    const raw = document.getElementById(`crit_${d.metric}_val`).value;
+    if (raw === '' || raw == null) {
+      throw new Error(`Enter a value for "${d.label}" or uncheck it.`);
+    }
+    const value = Number(raw);
+    if (!isFinite(value)) throw new Error(`"${d.label}" value must be a number.`);
+    out.push({ metric: d.metric, operator: op, value });
   }
-  return `<div class="source-header">
-    <span class="badge badge-${src.source}">${SOURCE_LABELS[src.source] || src.source}</span>
-    <span class="${statusClass}">${src.count > 0 ? src.count + ' result' + (src.count !== 1 ? 's' : '') : src.status}</span>
-  </div>${content}`;
-}
-
-function buildCombinedPane(sources, searchedIngredient) {
-  const allRecords = sources.flatMap(s => s.records || []);
-  if (!allRecords.length) return '<div class="info-box">No combined results.</div>';
-  return buildGroupedView('Combined', allRecords, searchedIngredient);
-}
-
-function render(data) {
-  lastResponse = data;
-  const { metadata, sources, ai_summary } = data;
-  const searchedIngredient = metadata.field === 'ingredient' ? metadata.query : null;
-
-  // Build status bar with full inline styles — no separate CSS class needed
-  const counts = sources.map(s => `${SOURCE_LABELS[s.source]||s.source}: <strong>${s.count}</strong>`).join(' &nbsp;|&nbsp; ');
-  let barText = `Searched for <strong>&ldquo;${escHtml(metadata.query)}&rdquo;</strong> by <em>${escHtml(metadata.field)}</em> &nbsp;&middot;&nbsp; ${counts}`;
-  if (metadata.normalized_terms?.length > 1) {
-    barText += ` &nbsp;&middot;&nbsp; <em>Also searched: ${metadata.normalized_terms.slice(1).map(escHtml).join(', ')}</em>`;
-  }
-  const _barHtml = `<div style="background:#fff3cd;border:1px solid #ffc107;border-left:6px solid #e6a500;border-radius:4px;padding:13px 18px;margin-bottom:20px;font-size:0.93rem;font-weight:500;color:#4a3600;box-shadow:0 2px 8px rgba(230,165,0,.2)">${barText}</div>`;
-
-  const aiDiv = document.getElementById('aiSummary');
-  if (ai_summary) {
-    aiDiv.innerHTML = `<strong>🤖 Summary</strong> <em style="font-size:.75rem;color:#666">(generated, may be imprecise; verify against raw data)</em><br/>${ai_summary}`;
-    aiDiv.style.display = 'block';
-  } else {
-    aiDiv.style.display = 'none';
-  }
-
-  const tabSources = ['Combined', ...sources.map(s => s.source)];
-  const tabLabels = { Combined: 'Combined', ...Object.fromEntries(sources.map(s=>[s.source, SOURCE_LABELS[s.source]||s.source])) };
-
-  let tabsHtml = '<div class="tabs">';
-  tabSources.forEach((t, i) => {
-    tabsHtml += `<button class="tab-btn${i===0?' active':''}" onclick="switchTab('${t}')" id="tab-${t}">${tabLabels[t]}</button>`;
-  });
-  tabsHtml += '</div>';
-
-  let panesHtml = '';
-  tabSources.forEach((t, i) => {
-    const content = t === 'Combined'
-      ? buildCombinedPane(sources, searchedIngredient)
-      : buildSourcePane(sources.find(s=>s.source===t), searchedIngredient);
-    panesHtml += `<div class="tab-pane${i===0?' active':''}" id="pane-${t}">${content}</div>`;
-  });
-
-  document.getElementById('results').innerHTML = _barHtml + tabsHtml + panesHtml;
-  document.getElementById('exportBtn').disabled = false;
-}
-
-function switchTab(name) {
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-  document.getElementById(`tab-${name}`)?.classList.add('active');
-  document.getElementById(`pane-${name}`)?.classList.add('active');
-}
-
-async function doSearch() {
-  const queries = parseQueries();
-  if (!queries.length) { alert('Please enter at least one ingredient.'); return; }
-  // Search previews the FIRST ingredient; multi-product export runs all.
-  const q = queries[0];
-  const field = document.getElementById('field').value;
-  if (queries.length > 1) {
-    // Show a brief notice that only the first is being previewed
-    document.getElementById('queryHint').innerHTML =
-      `<span style="color:var(--warn)">Previewing <strong>"${escHtml(q)}"</strong> only. Export will run all ${queries.length} ingredients side-by-side.</span>`;
-  }
-
-  document.getElementById('searchBtn').disabled = true;
-  document.getElementById('exportBtn').disabled = true;
-  document.getElementById('aiSummary').style.display = 'none';
-  document.getElementById('results').innerHTML = '<div class="loading-msg"><div class="spinner"></div>Querying all four databases concurrently…</div>';
-
-  // Close any in-progress export
-  _closeExport();
-
-  try {
-    const url = `/api/search?q=${encodeURIComponent(q)}&field=${field}&summary=false`;
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    render(data);
-  } catch (e) {
-    document.getElementById('results').innerHTML = `<div class="error-box">Search failed: ${e.message}</div>`;
-  } finally {
-    document.getElementById('searchBtn').disabled = false;
-  }
+  return out;
 }
 
 // ---- Async export with SSE progress ----
@@ -1534,14 +1391,17 @@ function _handleExportEvent(data) {
     stageLabel.textContent = `✓ Done in ${data.elapsed_s}s`;
     stats.textContent = '';
     _appendLog(`✓ ${data.log}`, 'log-ok');
-    // Auto-trigger download
+    // Auto-trigger download of the file the user asked for (full vs filtered).
+    const url = (_exportMode === 'filtered' && data.filtered_download_url)
+      ? data.filtered_download_url
+      : data.download_url;
     const a = document.createElement('a');
-    a.href = data.download_url;
+    a.href = url;
     a.style.display = 'none';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    document.getElementById('exportBtn').disabled = false;
+    _setExportButtonsDisabled(false);
     // Load dashboard from the same job's snapshot — no re-scraping
     _loadDashboard(currentJobId);
     _closeExport();
@@ -1553,7 +1413,7 @@ function _handleExportEvent(data) {
     stageLabel.textContent = `✗ Error`;
     stats.textContent = data.elapsed_s ? `${data.elapsed_s}s elapsed` : '';
     _appendLog(`✗ ERROR: ${data.message}`, 'log-err');
-    document.getElementById('exportBtn').disabled = false;
+    _setExportButtonsDisabled(false);
     _closeExport();
     return;
   }
@@ -1574,21 +1434,45 @@ async function resetAllCaches() {
   alert(`Cache cleared: ${data.http_rows_cleared} search results, ${data.patent_rows_cleared} patent records, ${data.labeling_rows_cleared} labeling records removed.`);
 }
 
-async function doExport() {
+function _setExportButtonsDisabled(disabled) {
+  document.getElementById('exportBtn').disabled = disabled;
+  document.getElementById('filterBtn').disabled = disabled;
+}
+
+// filtered=false → full workbook; filtered=true → screened Summary+Detail workbook.
+async function doExport(filtered) {
   const queries = parseQueries();
-  if (!queries.length) return;
+  if (!queries.length) { alert('Please enter at least one ingredient.'); return; }
   const field = document.getElementById('field').value;
 
-  // Disable export button, show panel
-  document.getElementById('exportBtn').disabled = true;
+  // For the filtered export, gather criteria up front so input errors abort early.
+  let criteria = [];
+  if (filtered) {
+    try {
+      criteria = collectCriteria();
+    } catch (e) {
+      alert(e.message);
+      document.getElementById('filterBox').open = true;
+      return;
+    }
+    if (!criteria.length) {
+      alert('Tick at least one filter criterion (and give it a value) to download a filtered Excel.');
+      document.getElementById('filterBox').open = true;
+      return;
+    }
+  }
+  _exportMode = filtered ? 'filtered' : 'full';
+
+  _setExportButtonsDisabled(true);
   const panel = document.getElementById('exportPanel');
   panel.style.display = 'block';
   document.getElementById('exportLog').innerHTML = '';
   document.getElementById('progressFill').style.width = '0%';
   document.getElementById('progressFill').classList.remove('error');
+  const what = filtered ? 'filtered export' : 'export';
   const label = queries.length === 1
-    ? `Exporting "${queries[0]}"…`
-    : `Exporting ${queries.length} ingredients side-by-side…`;
+    ? `Running ${what} for "${queries[0]}"…`
+    : `Running ${what} for ${queries.length} ingredients side-by-side…`;
   document.getElementById('exportStageLabel').textContent = label;
   document.getElementById('exportStats').textContent = '';
 
@@ -1599,6 +1483,7 @@ async function doExport() {
   try {
     const body = { queries, field, allow_partial: false, enable_ocr: true };
     if (_iqviaToken) body.iqvia_token = _iqviaToken;
+    if (filtered) body.filter_criteria = criteria;
     const resp = await fetch('/export/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1614,7 +1499,7 @@ async function doExport() {
   } catch (e) {
     document.getElementById('exportStageLabel').textContent = `✗ Error: ${e.message}`;
     document.getElementById('progressFill').classList.add('error');
-    document.getElementById('exportBtn').disabled = false;
+    _setExportButtonsDisabled(false);
     return;
   }
 
@@ -1635,14 +1520,14 @@ async function doExport() {
     if (currentJobId !== jobId) return; // stale
     _appendLog('Connection lost. Check server.', 'log-err');
     document.getElementById('exportStageLabel').textContent = 'Connection error';
-    document.getElementById('exportBtn').disabled = false;
+    _setExportButtonsDisabled(false);
     es.close();
   };
 }
 
-// Ctrl+Enter (or Cmd+Enter) submits search from the textarea
+// Ctrl+Enter (or Cmd+Enter) runs the full export from the textarea.
 document.getElementById('query').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doSearch();
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doExport(false);
 });
 
 // ---- Dashboard: consume exact XLSX dataset from job snapshot (no re-scraping) ----
@@ -1717,10 +1602,12 @@ async function uploadIqvia(input) {
     _iqviaToken = data.token;
     status.style.color = 'var(--muted)';
     status.textContent = `✓ Loaded`;
+    setIqviaCriteriaEnabled(true);  // unlock Value / Quantity criteria
   } catch (e) {
     status.style.color = 'var(--err)';
     status.textContent = `✗ ${e.message}`;
     _iqviaToken = null;
+    setIqviaCriteriaEnabled(false);
   }
 }
 
@@ -1788,6 +1675,9 @@ async function _loadDashboard(jobId) {
       `<div class="error-box">Dashboard load failed: ${escHtml(e.message)}</div>`;
   }
 }
+
+// ---- Init ----
+buildCriteriaRows();
 </script>
 </body>
 </html>
