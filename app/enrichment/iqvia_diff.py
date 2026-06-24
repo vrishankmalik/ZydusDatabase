@@ -155,37 +155,49 @@ class IqviaDiff:
     old_period: Optional[tuple[int, int]]
     new_period: Optional[tuple[int, int]]
     warnings: list[str] = field(default_factory=list)
+    reordered: bool = False
 
 
 def compare_iqvia(old_bytes: bytes, new_bytes: bytes) -> IqviaDiff:
     """Compare an older and a newer IQVIA extract; return only what changed.
 
-    ``old_bytes`` / ``new_bytes`` are the two uploaded files (xlsx or CSV).  Which
-    is old and which is new is the caller's declaration (the upload slots) — the
-    latest period is resolved per file but the slots are NOT auto-swapped; a likely
-    swap is surfaced as a warning instead.
+    ``old_bytes`` / ``new_bytes`` are the two uploaded files (xlsx or CSV) in the
+    caller's slot order (slot 1 = old, slot 2 = new).  Old vs new is decided by the
+    latest MAT period resolved per file, NOT by slot order: the file with the
+    earlier latest period is old, the later is new.  If that reverses the slots, the
+    files are auto-ordered older → newer and ``reordered`` is set (the workbook
+    surfaces a prominent notice).  On a tie (same latest period in both) the order
+    given is respected, with a plain informational note — never an error.
     """
-    old_period, old_agg = _aggregate_latest(old_bytes)
-    new_period, new_agg = _aggregate_latest(new_bytes)
+    slot1_period, slot1_agg = _aggregate_latest(old_bytes)   # caller's slot 1 ("old")
+    slot2_period, slot2_agg = _aggregate_latest(new_bytes)   # caller's slot 2 ("new")
 
-    warnings: list[str] = []
-    if old_period is None or new_period is None:
+    if slot1_period is None or slot2_period is None:
         raise ValueError(
             "No dated IQVIA metric columns (Dollars/Units/Ext Units MAT …) found in "
-            f"{'the OLD file' if old_period is None else 'the NEW file'}. "
+            f"{'slot 1 (the OLD file)' if slot1_period is None else 'slot 2 (the NEW file)'}. "
             "Make sure you uploaded the data extract, not a pivot/summary."
         )
-    if new_period < old_period:
-        warnings.append(
-            f"The 'new' file's latest MAT period ({_period_label(new_period)}) is OLDER "
-            f"than the 'old' file's ({_period_label(old_period)}) — the upload slots may "
-            "be swapped. Results below treat the slots as given."
-        )
-    elif new_period == old_period:
-        warnings.append(
-            f"Both files share the same latest MAT period ({_period_label(new_period)}); "
-            "moves reflect revisions/additions between two pulls of the same period."
-        )
+
+    warnings: list[str] = []
+    reordered = False
+    if slot2_period < slot1_period:
+        # Slot 1 is newer than slot 2 → the files were uploaded in the wrong order.
+        # Auto-order older → newer so the comparison below always runs old → new;
+        # the reversal is surfaced as a prominent banner in build_diff_workbook.
+        old_period, old_agg = slot2_period, slot2_agg
+        new_period, new_agg = slot1_period, slot1_agg
+        reordered = True
+    else:
+        # slot 2 newer (correct order) OR equal (tie → respect the order given).
+        old_period, old_agg = slot1_period, slot1_agg
+        new_period, new_agg = slot2_period, slot2_agg
+        if slot2_period == slot1_period:
+            warnings.append(
+                f"Both files share the same latest period ({_period_label(slot1_period)}); "
+                "compared in the order given (slot 1 = old, slot 2 = new). Moves reflect "
+                "revisions/additions between two pulls of the same period."
+            )
 
     entrant_rows: list[dict] = []
     exit_rows: list[dict] = []
@@ -239,7 +251,7 @@ def compare_iqvia(old_bytes: bytes, new_bytes: bytes) -> IqviaDiff:
             .reset_index(drop=True)
         )
 
-    return IqviaDiff(entrants, exits, moves, old_period, new_period, warnings)
+    return IqviaDiff(entrants, exits, moves, old_period, new_period, warnings, reordered)
 
 
 # ── Workbook ──────────────────────────────────────────────────────────────────
@@ -248,16 +260,30 @@ def build_diff_workbook(diff: IqviaDiff) -> bytes:
     """Render an IqviaDiff to a changes-only XLSX (Summary + 3 signal sheets)."""
     from app.enrichment.workbook import _style_sheet  # reuse the existing styling
 
+    # A prominent reorder notice leads the sheet (above the counts) when the upload
+    # slots were auto-corrected, so it cannot be missed as a buried warning row.
+    # Periods are rendered via _period_label → always YYYY/MM regardless of source
+    # file date format, so the two dates can never look mismatched.
+    banner_rows: list[dict] = []
+    if diff.reordered:
+        banner_rows.append({
+            "Metric": "⚠ FILES REORDERED",
+            "Value": (
+                f"Upload slots were reversed: slot 1's latest period "
+                f"({_period_label(diff.new_period)}) was NEWER than slot 2's "
+                f"({_period_label(diff.old_period)}). Compared as older → newer "
+                "automatically — 'Old' = the file uploaded in slot 2, 'New' = slot 1."
+            ),
+        })
+
     summary = pd.DataFrame(
-        [
-            {"Metric": "Old extract — latest MAT period", "Value": _period_label(diff.old_period)},
-            {"Metric": "New extract — latest MAT period", "Value": _period_label(diff.new_period)},
+        banner_rows
+        + [
             {"Metric": "New entrants", "Value": len(diff.entrants)},
             {"Metric": "Exits", "Value": len(diff.exits)},
             {"Metric": "Material moves", "Value": len(diff.moves)},
             {"Metric": "Materiality gate — Dollars", "Value": f"|Δ| ≥ {int(IQVIA_DIFF_DOLLARS_ABS):,} and ≥ {IQVIA_DIFF_PCT:.0%}"},
             {"Metric": "Materiality gate — Units", "Value": f"|Δ| ≥ {int(IQVIA_DIFF_UNITS_ABS):,} and ≥ {IQVIA_DIFF_PCT:.0%}"},
-            {"Metric": "Grain", "Value": "Combined Molecule × Product × Manufacturer × Strength (summed across channel/province/pack)"},
         ]
         + [{"Metric": "⚠ Warning", "Value": w} for w in diff.warnings],
         columns=["Metric", "Value"],

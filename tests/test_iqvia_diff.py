@@ -120,6 +120,21 @@ def test_workbook_has_four_sheets(diff):
     assert wb.sheetnames == ["Summary", "New Entrants", "Exits", "Material Moves"]
 
 
+def test_summary_has_no_extract_date_fields(diff):
+    # The per-file MAT periods are reporting periods, not extract/pull dates, so
+    # they were removed from the Summary sheet. Assert they cannot silently return:
+    # no Summary "Metric" cell may reference an extract date / MAT period.
+    import io
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(build_diff_workbook(diff)), read_only=True)
+    metrics = [
+        str(row[0].value or "")
+        for row in wb["Summary"].iter_rows(min_row=2, max_col=1)
+    ]
+    assert not any("extract" in m.lower() or "mat period" in m.lower() for m in metrics), metrics
+
+
 def test_no_invented_values_pct_blank_when_no_base():
     # A product present in old with zero Dollars but positive Units (so it is a
     # move, not an entrant) must leave Dollars Δ% blank rather than fabricate a %.
