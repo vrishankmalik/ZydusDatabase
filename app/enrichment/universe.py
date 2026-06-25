@@ -39,7 +39,6 @@ from app.enrichment.store import get_labeling_for_din
 from app.enrichment.workbook import (
     _LABELING_FIELDS,
     _apply_display_names,
-    _style_sheet,
     build_sheet1,
 )
 from app.models import DrugRecord, SearchMetadata, SearchResponse, SourceResult
@@ -574,44 +573,143 @@ UNIVERSE_NOT_EVALUATED_CAUTION = (
 )
 
 
-def _write_disclaimer_sheet(ws: Any, low_confidence_count: Optional[int]) -> None:
+# ── Streaming (write-only) workbook assembly ──────────────────────────────────
+# The universe sheet is the whole DPD catalogue (~13.5k rows).  A normal openpyxl
+# workbook holds every styled Cell object in RAM until save(), pushing the build
+# request's peak RSS to ~530 MB — over the 512 MB free-tier container limit.
+# openpyxl's write_only mode streams rows to a temp file via lxml and keeps almost
+# no cell state, cutting the workbook-write overhead from ~130 MB to a few MB (so
+# the build peaks ~220 MB).  Header rows are still styled (cheap); large data
+# sheets stream unstyled values, which is the standard pattern for big exports.
+
+def _wo_cell(ws: Any, value: Any, *, font=None, fill=None, alignment=None):
+    """A styled WriteOnlyCell (the only way to style cells in write_only mode)."""
+    from openpyxl.cell import WriteOnlyCell
+    c = WriteOnlyCell(ws, value=value)
+    if font is not None:
+        c.font = font
+    if fill is not None:
+        c.fill = fill
+    if alignment is not None:
+        c.alignment = alignment
+    return c
+
+
+def _wo_write_disclaimer_sheet(ws: Any, low_confidence_count: Optional[int]) -> None:
     from openpyxl.styles import Alignment, Font, PatternFill
-    title = ws.cell(row=1, column=1)
-    title.value = "⚠ READ ME: PDF data omitted"
-    title.font = Font(bold=True, size=12, color="FFFFFF", name="Calibri")
-    title.fill = PatternFill(start_color="C47F17", end_color="C47F17", fill_type="solid")
+    wrap = Alignment(wrap_text=True, vertical="top")
+    body_font = Font(name="Calibri", size=10)
+    red_font = Font(bold=True, name="Calibri", size=10, color="9B1C1C")
+
     ws.column_dimensions["A"].width = 110
-    r = 3
+    ws.append([_wo_cell(
+        ws, "⚠ READ ME: PDF data omitted",
+        font=Font(bold=True, size=12, color="FFFFFF", name="Calibri"),
+        fill=PatternFill(start_color="C47F17", end_color="C47F17", fill_type="solid"),
+    )])
+    ws.append([])  # blank row 2 (matches the original layout)
     for line in UNIVERSE_DISCLAIMER_LINES:
-        c = ws.cell(row=r, column=1)
-        c.value = line
-        c.alignment = Alignment(wrap_text=True, vertical="top")
-        c.font = Font(name="Calibri", size=10)
-        r += 1
+        ws.append([_wo_cell(ws, line, font=body_font, alignment=wrap)])
     # Bold red safety caution — blank patent/NOC/DP cells must not be read as "none".
-    caution = ws.cell(row=r + 1, column=1)
-    caution.value = UNIVERSE_NOT_EVALUATED_CAUTION
-    caution.alignment = Alignment(wrap_text=True, vertical="top")
-    caution.font = Font(bold=True, name="Calibri", size=10, color="9B1C1C")
-    r += 2
+    ws.append([])
+    ws.append([_wo_cell(ws, UNIVERSE_NOT_EVALUATED_CAUTION, font=red_font, alignment=wrap)])
     if low_confidence_count is not None:
-        c = ws.cell(row=r + 1, column=1)
-        c.value = (
-            f"IQVIA low-confidence (fuzzy) matches in this dataset: {low_confidence_count}"
-        )
-        c.font = Font(bold=True, name="Calibri", size=10, color="9B1C1C")
+        ws.append([])
+        ws.append([_wo_cell(
+            ws,
+            f"IQVIA low-confidence (fuzzy) matches in this dataset: {low_confidence_count}",
+            font=red_font,
+        )])
 
 
-def _df_to_sheet(ws: Any, df: pd.DataFrame) -> None:
-    """Write a DataFrame to a worksheet and apply the shared header styling."""
+def _wo_write_data_sheet(ws: Any, df: pd.DataFrame) -> None:
+    """Stream a DataFrame to a write_only worksheet, byte-for-byte equivalent to the
+    normal-mode ``_df_to_sheet`` + ``_style_sheet`` output.
+
+    Reproduces the shared styling EXACTLY — grey bold centered header, frozen header
+    row, header autofilter, content-aware column widths, and the per-data-cell
+    Calibri-10 / centered / wrapped formatting.  The style objects are created once
+    and reused (openpyxl deduplicates them), and write_only streams each row to the
+    lxml temp file and releases it, so memory stays flat regardless of row count
+    even though every cell is individually styled.
+    """
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
     from app.enrichment.workbook import _safe_cell_val
+
     cols = list(df.columns)
+    header_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    header_font = Font(bold=True, name="Calibri", size=10)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    # Shared once; reused for every data cell (matches _style_sheet's per-cell style).
+    data_font = Font(name="Calibri", size=10)
+    data_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # In write_only mode, sheet-level properties (column widths, freeze panes,
+    # autofilter) must be set BEFORE the first append() or they are not written.
+    for i, col in enumerate(cols, 1):
+        max_val_len = (
+            df[col].fillna("").astype(str).str.len().max() if not df.empty else 0
+        )
+        width = min(max(len(str(col)) + 2, int(max_val_len or 0) + 2), 60)
+        ws.column_dimensions[get_column_letter(i)].width = width
+    ws.freeze_panes = "A2"
+    if not df.empty:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}1"
+
+    ws.append([
+        _wo_cell(ws, str(col), font=header_font, fill=header_fill, alignment=header_align)
+        for col in cols
+    ])
+    for row in df.itertuples(index=False, name=None):
+        ws.append([
+            _wo_cell(ws, _safe_cell_val(v), font=data_font, alignment=data_align)
+            for v in row
+        ])
+
+
+def _wo_write_reconciliation_sheet(wb: Any, recon_df: pd.DataFrame) -> None:
+    """Write-only twin of workbook._write_reconciliation_sheet (same colours)."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    from app.enrichment.workbook import _safe_cell_val
+
+    ws = wb.create_sheet(title="IQVIA Reconciliation")
+    STATUS_FILLS = {
+        "matched": "C6EFCE", "ambiguous": "FFEB9C", "low_score": "FFD7B5",
+        "no_din_match": "FFC7CE", "din_no_iqvia_match": "E2EFDA",
+    }
+    cols = list(recon_df.columns)
+    header_fill = PatternFill(start_color="3D226E", end_color="3D226E", fill_type="solid")
+    header_font = Font(bold=True, name="Calibri", size=10, color="FFFFFF")
+    center = Alignment(horizontal="center", vertical="center")
+    body_font = Font(name="Calibri", size=10)
+    top = Alignment(vertical="top")
+
+    # Sheet-level props before the first append (write_only requirement).
     for j, col in enumerate(cols, 1):
-        ws.cell(row=1, column=j).value = str(col)
-    for i, (_, row) in enumerate(df.iterrows(), 2):
-        for j, col in enumerate(cols, 1):
-            ws.cell(row=i, column=j).value = _safe_cell_val(row[col])
-    _style_sheet(ws, df)
+        ws.column_dimensions[get_column_letter(j)].width = min(max(len(col) + 4, 14), 40)
+    ws.freeze_panes = "A2"
+    if cols and recon_df.shape[0] > 0:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(cols))}1"
+
+    ws.append([
+        _wo_cell(ws, col.replace("_", " ").title(), font=header_font, fill=header_fill, alignment=center)
+        for col in cols
+    ])
+    fill_cache: dict[str, Any] = {}
+    for row in recon_df.itertuples(index=False, name=None):
+        rowmap = dict(zip(cols, row))
+        status = str(rowmap.get("status", "") or "")
+        hex_fill = STATUS_FILLS.get(status, "FFFFFF")
+        fill = fill_cache.get(hex_fill)
+        if fill is None:
+            fill = PatternFill(start_color=hex_fill, end_color=hex_fill, fill_type="solid")
+            fill_cache[hex_fill] = fill
+        ws.append([
+            _wo_cell(ws, _safe_cell_val(rowmap[c]), font=body_font, fill=fill, alignment=top)
+            for c in cols
+        ])
 
 
 def build_universe_workbook(
@@ -620,25 +718,27 @@ def build_universe_workbook(
     recon_df: Optional[pd.DataFrame] = None,
     low_confidence_count: Optional[int] = None,
 ) -> bytes:
-    """Assemble the option-3 workbook: Disclaimer + universe data tabs (no PDF)."""
+    """Assemble the option-3 workbook: Disclaimer + universe data tabs (no PDF).
+
+    Uses openpyxl write_only mode so a full ~13.5k-row universe builds within the
+    512 MB free-tier memory limit (see the module-level note above).
+    """
     import openpyxl
 
     buf = io.BytesIO()
-    wb = openpyxl.Workbook()
-    ws_disc = wb.active
-    ws_disc.title = "⚠ Read Me"
-    _write_disclaimer_sheet(ws_disc, low_confidence_count)
+    wb = openpyxl.Workbook(write_only=True)
 
-    s1_out = _apply_display_names(sheet1_df)
+    ws_disc = wb.create_sheet(title="⚠ Read Me")
+    _wo_write_disclaimer_sheet(ws_disc, low_confidence_count)
+
     ws1 = wb.create_sheet(title="Full Universe (no PDF)")
-    _df_to_sheet(ws1, s1_out)
+    _wo_write_data_sheet(ws1, _apply_display_names(sheet1_df))
 
     ws2 = wb.create_sheet(title="Generic Submissions")
-    _df_to_sheet(ws2, sheet2_df)
+    _wo_write_data_sheet(ws2, sheet2_df)
 
     if recon_df is not None and not recon_df.empty:
-        from app.enrichment.workbook import _write_reconciliation_sheet
-        _write_reconciliation_sheet(wb, recon_df)
+        _wo_write_reconciliation_sheet(wb, recon_df)
 
     wb.save(buf)
     return buf.getvalue()

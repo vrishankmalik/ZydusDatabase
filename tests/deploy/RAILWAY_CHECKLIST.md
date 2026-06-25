@@ -6,7 +6,8 @@ Railway service, then run the live test suite against the deployed URL.
 
 > Measured on this machine 2026-06-25: full DPD universe = **13,550 products**,
 > **55** dosage-form bases, **308** active data-protection register rows; full
-> universe + IQVIA build **peak RSS ≈ 529 MB**.
+> universe + IQVIA build **peak RSS ≈ 359 MB** (fits the 512 MB free tier after the
+> streaming-workbook fix below; was 529 MB before).
 
 ---
 
@@ -33,13 +34,19 @@ in the normal offline suite and need neither BASE_URL nor network.
 - [ ] After deploy: `GET /` returns 200 → `test_health_root_responds`.
 - [ ] Health check path in Railway settings set to `/` (returns 200, no heavy work).
 
-## 2. Memory ceiling — **risk R7** *(action required)*
+## 2. Memory ceiling — **risk R7** *(was a blocker; fixed — now fits free tier)*
 
-- [ ] **Pick a plan with ≥ 1 GB RAM.** Measured peak ≈ **529 MB**, which **exceeds the
-      512 MB** small-plan limit — a full universe + IQVIA build would OOM-kill on 512 MB.
-- [ ] Re-measure on the target plan's limit: `MEM_CEILING_MB=<plan-MB> pytest tests/deploy/test_deploy_memory_local.py -m integration -s`.
-- [ ] Headroom note: baseline ≈ 110 MB, build adds ≈ 419 MB. Concurrent full builds
-      stack memory — see §6; keep to one build at a time.
+- [x] **Fits the 512 MB free tier.** Measured peak ≈ **359 MB** (baseline ≈ 110 MB),
+      ~150 MB headroom. *Before the fix it was 529 MB and would OOM-kill on 512 MB.*
+- [x] Fix: the universe workbook writer now streams via openpyxl **write_only** mode
+      (`build_universe_workbook` in `app/enrichment/universe.py`) instead of holding
+      the whole 13.5k-row styled cell tree in RAM. Output is byte-for-byte identical.
+      The remaining ~359 MB peak is the IQVIA xlsx *read*, which happens at upload time
+      (a separate request from the universe build), not stacked with the workbook write.
+- [x] Regression guard: `tests/deploy/test_deploy_memory_local.py` asserts peak <
+      `MEM_CEILING_MB` (**default 512**) on a full build.
+- [ ] Concurrent full builds stack memory — see §6; keep to one build at a time
+      (single instance already enforces this).
 
 ## 3. Single worker / single instance — **risk R2 (highest prod-break likelihood)**
 

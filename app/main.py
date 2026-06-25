@@ -1769,17 +1769,23 @@ function buildExtraCriteria(suffix, containerId) {
     .concat(NO_FILE_OPS.map(o => `<option value="${o.value}">${o.label}</option>`)).join('');
   wrap.innerHTML = `
     <div class="crit-row" style="display:flex;align-items:flex-start;gap:9px;flex-wrap:wrap;margin-top:2px;">
-      <label style="min-width:230px;font-size:0.86rem;padding-top:4px;">Dosage form
-        <span style="display:block;font-weight:400;color:var(--muted);font-size:0.72rem;">base form; matches every sub-form (e.g. TABLET also matches TABLET (EXTENDED-RELEASE))</span>
+      <label style="min-width:230px;font-size:0.86rem;padding-top:4px;display:flex;align-items:flex-start;gap:7px;cursor:pointer;">
+        <input type="checkbox" id="dform_${suffix}_on" style="margin-top:3px;">
+        <span>Dosage form
+          <span style="display:block;font-weight:400;color:var(--muted);font-size:0.72rem;">base form; matches every sub-form (e.g. TABLET also matches TABLET (EXTENDED-RELEASE))</span>
+        </span>
       </label>
-      <select id="dform_${suffix}" multiple size="6"
-        style="min-width:240px;padding:4px 8px;border:1px solid var(--border);border-radius:3px;font-size:0.84rem;">
-        <option disabled>open this panel to load…</option>
-      </select>
+      <div id="dform_${suffix}"
+        style="min-width:240px;max-height:160px;overflow-y:auto;padding:6px 8px;border:1px solid var(--border);border-radius:3px;font-size:0.84rem;display:flex;flex-direction:column;gap:4px;">
+        <span style="color:var(--muted);">open this panel to load…</span>
+      </div>
     </div>
     <div class="crit-row" style="display:flex;align-items:flex-start;gap:9px;flex-wrap:wrap;margin-top:9px;">
-      <label style="min-width:230px;font-size:0.86rem;padding-top:4px;">Six-year no-file date
-        <span style="display:block;font-weight:400;color:var(--muted);font-size:0.72rem;">Month / Day / Year; future dates only</span>
+      <label style="min-width:230px;font-size:0.86rem;padding-top:4px;display:flex;align-items:flex-start;gap:7px;cursor:pointer;">
+        <input type="checkbox" id="nofile_${suffix}_on" style="margin-top:3px;">
+        <span>Six-year no-file date
+          <span style="display:block;font-weight:400;color:var(--muted);font-size:0.72rem;">Month / Day / Year; future dates only</span>
+        </span>
       </label>
       <select id="nofileop_${suffix}" style="padding:4px 8px;border:1px solid var(--border);border-radius:3px;font-size:0.84rem;">${opOpts}</select>
       <input type="text" id="nofileval_${suffix}" placeholder="MM/DD/YYYY" maxlength="10"
@@ -1794,17 +1800,21 @@ let _dosageFormsLoaded = false;
 async function populateDosageForms() {
   const sels = ['dform_s', 'dform_u'].map(id => document.getElementById(id)).filter(Boolean);
   if (!sels.length || _dosageFormsLoaded) return;
-  sels.forEach(s => { s.innerHTML = '<option disabled>Loading dosage forms…</option>'; });
+  sels.forEach(s => { s.innerHTML = '<span style="color:var(--muted);">Loading dosage forms…</span>'; });
   try {
     const resp = await fetch('/api/dosage-forms');
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
-    const opts = (data.base_forms || [])
-      .map(f => `<option value="${escHtml(f)}">${escHtml(f)}</option>`).join('');
+    const forms = data.base_forms || [];
+    const opts = forms.map(f => `
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:400;">
+        <input type="checkbox" class="dform-opt" value="${escHtml(f)}">
+        <span>${escHtml(f)}</span>
+      </label>`).join('') || '<span style="color:var(--muted);">No dosage forms found.</span>';
     sels.forEach(s => { s.innerHTML = opts; });
     _dosageFormsLoaded = true;
   } catch (e) {
-    sels.forEach(s => { s.innerHTML = '<option disabled>Failed to load. Reopen to retry</option>'; });
+    sels.forEach(s => { s.innerHTML = '<span style="color:var(--err);">Failed to load. Reopen to retry</span>'; });
   }
 }
 
@@ -1823,16 +1833,19 @@ function _checkFutureMdy(s) {
 // Append the two additive filter entries (if set) to a criteria list. Throws on
 // a partially-filled / invalid date so input errors abort early, like the six.
 function collectExtraCriteria(suffix, out) {
-  const dsel = document.getElementById(`dform_${suffix}`);
-  if (dsel) {
-    const picked = Array.from(dsel.selectedOptions).map(o => o.value).filter(Boolean);
-    if (picked.length) out.push({ metric: 'dosage_form', value: picked });
+  const dformOn = document.getElementById(`dform_${suffix}_on`);
+  if (dformOn && dformOn.checked) {
+    const dsel = document.getElementById(`dform_${suffix}`);
+    const picked = dsel ? Array.from(dsel.querySelectorAll('input.dform-opt:checked')).map(o => o.value).filter(Boolean) : [];
+    if (!picked.length) throw new Error('Pick at least one dosage form, or uncheck "Dosage form".');
+    out.push({ metric: 'dosage_form', value: picked });
   }
-  const op = (document.getElementById(`nofileop_${suffix}`) || {}).value || '';
-  const val = ((document.getElementById(`nofileval_${suffix}`) || {}).value || '').trim();
-  if (op || val) {
-    if (!op) throw new Error('Pick an operator for the six-year no-file date, or clear the date.');
-    if (!val) throw new Error('Enter a six-year no-file date (MM/DD/YYYY), or clear the operator.');
+  const nofileOn = document.getElementById(`nofile_${suffix}_on`);
+  if (nofileOn && nofileOn.checked) {
+    const op = (document.getElementById(`nofileop_${suffix}`) || {}).value || '';
+    const val = ((document.getElementById(`nofileval_${suffix}`) || {}).value || '').trim();
+    if (!op) throw new Error('Pick an operator for the six-year no-file date, or uncheck it.');
+    if (!val) throw new Error('Enter a six-year no-file date (MM/DD/YYYY), or uncheck it.');
     _checkFutureMdy(val);
     out.push({ metric: 'no_file_date', operator: op, value: val });
   }
