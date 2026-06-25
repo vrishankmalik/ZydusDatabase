@@ -737,8 +737,5 @@ def build_universe_workbook(
     ws2 = wb.create_sheet(title="Generic Submissions")
     _wo_write_data_sheet(ws2, sheet2_df)
 
-    if recon_df is not None and not recon_df.empty:
-        _wo_write_reconciliation_sheet(wb, recon_df)
-
     wb.save(buf)
     return buf.getvalue()
